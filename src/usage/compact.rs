@@ -3,23 +3,49 @@
 //! this assembly; only callers requesting detailed events allocate owned strings again.
 
 use super::{UsageActivityPoint, UsageEvent, UsageEventData};
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-pub(super) type UsageEventView<'a> = UsageEventData<&'a str, &'a str>;
+pub(crate) type UsageEventView<'a> = UsageEventData<&'a str, &'a str>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct StringId(NonZeroUsize);
 
-pub(super) enum UsageAssembly {
-    Owned(Vec<UsageEvent>),
-    Compact(CompactUsageAssembly),
+/// Retained usage events: every assembly is compacted (dictionary-encoded
+/// text), so filtering and reporting borrow instead of cloning per event.
+pub(crate) struct UsageAssembly(CompactUsageAssembly);
+
+/// Compact borrowed rows while their backing storage is still available.
+#[derive(Default)]
+pub(crate) struct UsageAssemblyBuilder {
+    assembly: CompactUsageAssembly,
+    dictionary: HashMap<String, StringId>,
 }
 
-pub(super) struct FilterFields<'a> {
+impl UsageAssemblyBuilder {
+    pub(crate) fn push(&mut self, event: UsageEventView<'_>) {
+        let intern_text = |text: &str, dictionary: &mut HashMap<String, StringId>| {
+            dictionary
+                .get(text)
+                .copied()
+                .unwrap_or_else(|| intern(dictionary, text.to_owned()))
+        };
+        let path = intern_text(event.source_path, &mut self.dictionary);
+        self.assembly
+            .events
+            .push(event.map_text(path, |text| intern_text(text, &mut self.dictionary)));
+    }
+
+    pub(crate) fn finish(mut self) -> UsageAssembly {
+        self.assembly.events.shrink_to_fit();
+        self.assembly.pack_dictionary(self.dictionary);
+        UsageAssembly(self.assembly)
+    }
+}
+
+pub(crate) struct FilterFields<'a> {
     pub source: &'static str,
-    pub timestamp_ms: u64,
     pub permission_review: bool,
     pub project: Option<&'a str>,
     pub session_id: Option<&'a str>,
@@ -27,64 +53,81 @@ pub(super) struct FilterFields<'a> {
 
 impl UsageAssembly {
     pub fn new(events: Vec<UsageEvent>, previous: Option<Self>) -> Self {
-        let previous = match previous {
-            Some(Self::Compact(assembly)) => Some(assembly),
-            _ => None,
-        };
-        Self::Compact(CompactUsageAssembly::new(events, previous))
+        Self(CompactUsageAssembly::new(
+            events,
+            previous.map(|assembly| assembly.0),
+        ))
     }
 
     pub fn len(&self) -> usize {
-        match self {
-            Self::Owned(events) => events.len(),
-            Self::Compact(assembly) => assembly.events.len(),
+        self.0.events.len()
+    }
+
+    pub fn timestamp_ms(&self, index: usize) -> u64 {
+        self.0.events[index].timestamp_ms
+    }
+
+    /// Global sort key: timestamp, source path, then source order. Merging
+    /// partitions by this key reproduces the combined assembly's sort exactly.
+    pub fn sort_key(&self, index: usize) -> (u64, &str, u64) {
+        let event = &self.0.events[index];
+        (
+            event.timestamp_ms,
+            self.0.text(event.source_path),
+            event.source_order,
+        )
+    }
+
+    /// Lower bound of `since` in the timestamp-sorted assembly.
+    pub fn lower_bound(&self, since: u64) -> usize {
+        let mut lo = 0;
+        let mut hi = self.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.timestamp_ms(mid) < since {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
+        lo
+    }
+
+    /// Upper bound of `until` (first index with `timestamp >= until`) starting from `start`.
+    pub fn upper_bound(&self, until: u64, start: usize) -> usize {
+        let mut lo = start;
+        let mut hi = self.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.timestamp_ms(mid) < until {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
     }
 
     pub fn filter_fields(&self, index: usize) -> FilterFields<'_> {
-        match self {
-            Self::Owned(events) => {
-                let event = &events[index];
-                FilterFields {
-                    source: event.source,
-                    timestamp_ms: event.timestamp_ms,
-                    permission_review: event.permission_review,
-                    project: event.project.as_deref(),
-                    session_id: event.session_id.as_deref(),
-                }
-            }
-            Self::Compact(assembly) => {
-                let event = &assembly.events[index];
-                FilterFields {
-                    source: event.source,
-                    timestamp_ms: event.timestamp_ms,
-                    permission_review: event.permission_review,
-                    project: event.project.map(|id| assembly.text(id)),
-                    session_id: event.session_id.map(|id| assembly.text(id)),
-                }
-            }
+        let event = &self.0.events[index];
+        FilterFields {
+            source: event.source,
+            permission_review: event.permission_review,
+            project: event.project.map(|id| self.0.text(id)),
+            session_id: event.session_id.map(|id| self.0.text(id)),
         }
     }
 
     pub fn activity_point(&self, index: usize) -> UsageActivityPoint {
-        match self {
-            Self::Owned(events) => events[index].activity_point(),
-            Self::Compact(assembly) => assembly.events[index].activity_point(),
-        }
+        self.0.events[index].activity_point()
     }
 
     pub fn view(&self, index: usize) -> UsageEventView<'_> {
-        match self {
-            Self::Owned(events) => events[index].view(),
-            Self::Compact(assembly) => assembly.view(index),
-        }
+        self.0.view(index)
     }
 
     pub fn details(&self, indices: impl Iterator<Item = usize>) -> Vec<UsageEvent> {
-        match self {
-            Self::Owned(events) => indices.map(|index| events[index].clone()).collect(),
-            Self::Compact(assembly) => assembly.details(indices),
-        }
+        self.0.details(indices)
     }
 }
 
@@ -113,6 +156,11 @@ impl CompactUsageAssembly {
             event.map_text(path, |text| intern(&mut dictionary, text))
         }));
 
+        assembly.pack_dictionary(dictionary);
+        assembly
+    }
+
+    fn pack_dictionary(&mut self, dictionary: HashMap<String, StringId>) {
         // Pack the dictionary into one allocation; keep neither a lookup hash table
         // nor one allocation per unique string alive between requests.
         let mut ordered = vec![String::new(); dictionary.len()];
@@ -121,13 +169,12 @@ impl CompactUsageAssembly {
             bytes += text.len();
             ordered[id.0.get() - 1] = text;
         }
-        assembly.text.reserve(bytes);
-        assembly.ends.reserve(ordered.len());
+        self.text.reserve(bytes);
+        self.ends.reserve(ordered.len());
         for value in ordered {
-            assembly.text.push_str(&value);
-            assembly.ends.push(assembly.text.len());
+            self.text.push_str(&value);
+            self.ends.push(self.text.len());
         }
-        assembly
     }
 
     pub fn text(&self, id: StringId) -> &str {
@@ -223,7 +270,6 @@ mod tests {
         empty.source_order = 0;
         let original = vec![event, empty];
         let assembly = CompactUsageAssembly::new(original.clone(), None);
-        let owned = UsageAssembly::Owned(original.clone());
         for (index, expected) in original.iter().enumerate() {
             let actual = assembly.event(index);
             assert_eq!(
@@ -239,16 +285,12 @@ mod tests {
                 serde_json::to_value(assembly.view(index)).unwrap(),
                 serde_json::to_value(expected).unwrap()
             );
-            assert_eq!(
-                serde_json::to_value(owned.view(index)).unwrap(),
-                serde_json::to_value(expected).unwrap()
-            );
         }
     }
 
     #[test]
     fn repeated_text_is_stored_once_across_fields_and_events() {
-        let event = super::super::tests::cache_event("same", 1, "same", 10, 0, 0);
+        let event = super::super::cache_event("same", 1, "same", 10, 0, 0);
         let assembly = CompactUsageAssembly::new(vec![event; 100], None);
         assert_eq!(assembly.ends.len(), 3); // path, "same", provider
         assert_eq!(
@@ -266,13 +308,13 @@ mod tests {
 
     #[test]
     fn refresh_reuses_storage_and_replaces_events_without_stale_text() {
-        let event = super::super::tests::cache_event("old", 1, "same", 10, 0, 0);
+        let event = super::super::cache_event("old", 1, "same", 10, 0, 0);
         let mut assembly = CompactUsageAssembly::new(vec![event; 100], None);
         let event_buffer = assembly.events.as_ptr();
         let text_buffer = assembly.text.as_ptr();
         let offset_buffer = assembly.ends.as_ptr();
         for timestamp in 2..22 {
-            let mut updated = super::super::tests::cache_event("new", timestamp, "diff", 20, 0, 0);
+            let mut updated = super::super::cache_event("new", timestamp, "diff", 20, 0, 0);
             updated.permission_review = true;
             assembly = CompactUsageAssembly::new(vec![updated.clone(); 100], Some(assembly));
             assert_eq!(assembly.events.as_ptr(), event_buffer);
@@ -286,7 +328,7 @@ mod tests {
             assert!(assembly.view(99).permission_review);
         }
 
-        let grown = super::super::tests::cache_event("bigger", 22, "same", 30, 0, 0);
+        let grown = super::super::cache_event("bigger", 22, "same", 30, 0, 0);
         assembly = CompactUsageAssembly::new(vec![grown.clone(); 101], Some(assembly));
         assert_eq!(assembly.events.len(), 101);
         assert_eq!(
@@ -299,6 +341,14 @@ mod tests {
         assert!(assembly.text.is_empty());
         assert!(assembly.ends.is_empty());
         assert!(assembly.details(0..0).is_empty());
+    }
+
+    #[test]
+    fn openai_cached_input_is_a_subset() {
+        let tokens = TokenBuckets::codex(100, 80, 10, 4);
+        assert_eq!(tokens.uncached_input, 20);
+        assert_eq!(tokens.cache_read, 80);
+        assert_eq!(tokens.additive_total(), 110);
     }
 }
 
@@ -323,32 +373,6 @@ impl<S, P> UsageEventData<S, P> {
             provider: self.provider.map(&mut map),
             model: self.model.map(&mut map),
             tokens: self.tokens,
-            source_cost_usd: self.source_cost_usd,
-            cost_authoritative: self.cost_authoritative,
-            dedupe_confidence: self.dedupe_confidence,
-            conservative_undercount: self.conservative_undercount,
-            cache_chain_excluded: self.cache_chain_excluded,
-            sidechain: self.sidechain,
-            permission_review: self.permission_review,
-            source_order: self.source_order,
-        }
-    }
-}
-
-impl UsageEvent {
-    fn view(&self) -> UsageEventView<'_> {
-        UsageEventData {
-            source: self.source,
-            source_path: &self.source_path,
-            source_record_id: self.source_record_id.as_deref(),
-            session_id: self.session_id.as_deref(),
-            request_id: self.request_id.as_deref(),
-            message_id: self.message_id.as_deref(),
-            timestamp_ms: self.timestamp_ms,
-            project: self.project.as_deref(),
-            provider: self.provider.as_deref(),
-            model: self.model.as_deref(),
-            tokens: self.tokens.clone(),
             source_cost_usd: self.source_cost_usd,
             cost_authoritative: self.cost_authoritative,
             dedupe_confidence: self.dedupe_confidence,

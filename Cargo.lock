@@ -3379,6 +3379,7 @@ dependencies = [
  "getrandom 0.3.4",
  "gix",
  "globset",
+ "hashbrown 0.17.1",
  "hmac",
  "indicatif 0.17.11",
  "libc",
@@ -4933,6 +4934,7 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest 0.10.7",
+ "sha2-asm",
 ]
 
 [[package]]
@@ -4944,6 +4946,15 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
  "digest 0.11.3",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
