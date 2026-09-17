@@ -4736,6 +4736,184 @@ fn antigravity_ingest_tracks_wal_updates_and_checkpoint_without_duplicates() {
 }
 
 #[test]
+fn antigravity_cli_transcript_ingests_through_full_scan_and_dirty_selection() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("gemini");
+    let logs = source.join("antigravity-cli/brain/sess-uuid-789/.system_generated/logs");
+    fs::create_dir_all(&logs).unwrap();
+    let transcript = logs.join("transcript.jsonl");
+    let _env = EnvVarGuard::set_os(&[("ANTIGRAVITY_HOME", Some(source.as_os_str()))]);
+    let write_transcript = |lines: &[&str]| fs::write(&transcript, lines.join("\n")).unwrap();
+    write_transcript(&[
+        r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-09-15T23:44:54Z","content":"<USER_REQUEST>\nfind the leak\n</USER_REQUEST>"}"#,
+        r#"{"step_index":1,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-09-15T23:44:56Z","content":"patched it"}"#,
+    ]);
+    let mut options = ingest_options(false, ModelChoice::Gemma);
+    options.include_antigravity = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let full = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    assert_eq!(full().records_added, 2);
+    assert_eq!(indexed_texts(&paths), ["find the leak", "patched it"]);
+    assert_eq!(full().records_added, 0);
+
+    // The dirty path routes transcript.jsonl through selection (not just .db).
+    write_transcript(&[
+        r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-09-15T23:44:54Z","content":"<USER_REQUEST>\nfind the leak\n</USER_REQUEST>"}"#,
+        r#"{"step_index":1,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-09-15T23:44:56Z","content":"patched it"}"#,
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-09-15T23:44:58Z","content":"shipped"}"#,
+    ]);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let result = ingest_dirty(
+        &paths,
+        &index,
+        &options,
+        &lease,
+        &HashSet::from([transcript.clone()]),
+    )
+    .unwrap();
+    assert!(!result.full_scan);
+    assert_eq!(
+        indexed_texts(&paths),
+        ["find the leak", "patched it", "shipped"]
+    );
+}
+
+#[test]
+fn antigravity_projection_changes_retire_all_published_state() {
+    let _guard = env_lock();
+    for dirty in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("gemini");
+        let logs = source.join("antigravity-cli/brain/session/.system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let _env = EnvVarGuard::set_os(&[("ANTIGRAVITY_HOME", Some(source.as_os_str()))]);
+        let overview = logs.join("overview.txt");
+        let database = source.join("antigravity-ide/conversations/session.db");
+        let transcript = logs.join("transcript.jsonl");
+        let full_transcript = logs.join("transcript_full.jsonl");
+        let candidates = [&overview, &database, &transcript, &full_transcript]
+            .map(|path| path.to_string_lossy().into_owned())
+            .into_iter()
+            .collect::<HashSet<_>>();
+        fs::write(
+            &overview,
+            r#"{"type":"USER_INPUT","status":"DONE","content":"overview"}"#,
+        )
+        .unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let lease = ingest_lease(&paths);
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.include_antigravity = true;
+        let refresh = |hint: &Path| {
+            let index = open_search_index(&paths);
+            if dirty {
+                ingest_dirty(
+                    &paths,
+                    &index,
+                    &options,
+                    &lease,
+                    &HashSet::from([hint.to_path_buf()]),
+                )
+                .unwrap();
+            } else {
+                ingest_all(&paths, &index, &options, &lease).unwrap();
+            }
+        };
+        let assert_owner = |owner: &Path, expected: &str| {
+            assert_eq!(indexed_texts(&paths), [expected]);
+            let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+            assert_eq!(
+                state.files.keys().cloned().collect::<HashSet<_>>(),
+                HashSet::from([owner.to_string_lossy().into_owned()])
+            );
+            let analytics = AnalyticsStore::open_read_only(analytics_path(&paths.state)).unwrap();
+            assert_eq!(
+                analytics.source_paths(&candidates).unwrap(),
+                HashSet::from([owner.to_string_lossy().into_owned()])
+            );
+        };
+        refresh(&overview);
+        assert_owner(&overview, "overview");
+        let old_record = open_search_index(&paths)
+            .records_by_session_id("session")
+            .unwrap()
+            .remove(0);
+        let mut vectors = VectorIndex::open_or_create(&paths.vectors, 4, Some("fixture")).unwrap();
+        vectors
+            .add(old_record.doc_id, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        vectors.save().unwrap();
+        drop(vectors);
+
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let db = rusqlite::Connection::open(&database).unwrap();
+        db.execute_batch("CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB);").unwrap();
+        db.execute(
+            "INSERT INTO steps VALUES (0,14,3,?1)",
+            [b"\x9a\x01\x0a\x12\x08database".as_slice()],
+        )
+        .unwrap();
+        drop(db);
+        refresh(&database);
+        assert_owner(&database, "database");
+        assert!(
+            !VectorIndex::inventory(&paths.vectors)
+                .unwrap()
+                .unwrap()
+                .doc_ids
+                .contains(&old_record.doc_id)
+        );
+
+        fs::write(
+            &transcript,
+            r#"{"type":"USER_INPUT","status":"DONE","content":"transcript"}"#,
+        )
+        .unwrap();
+        refresh(&transcript);
+        assert_owner(&transcript, "transcript");
+        for sibling in [&overview, &database] {
+            refresh(sibling);
+            assert_owner(&transcript, "transcript");
+        }
+
+        // Simulate pre-upgrade duplicates with no checkpoint for the stale path.
+        let index = open_search_index(&paths);
+        let mut writer = index.writer().unwrap();
+        index.add_record(&mut writer, &old_record).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        analytics.record(&old_record).unwrap();
+        analytics.flush().unwrap();
+        drop(analytics);
+        refresh(&overview);
+        assert_owner(&transcript, "transcript");
+
+        fs::write(
+            &full_transcript,
+            r#"{"type":"VIEW_FILE","content":"fullonlysentinel"}"#,
+        )
+        .unwrap();
+        refresh(&full_transcript);
+        assert_owner(&full_transcript, "fullonlysentinel");
+        for sibling in [&overview, &database, &transcript] {
+            refresh(sibling);
+            assert_owner(&full_transcript, "fullonlysentinel");
+        }
+        fs::remove_file(&full_transcript).unwrap();
+        refresh(&full_transcript);
+        assert_owner(&transcript, "transcript");
+    }
+}
+
+#[test]
 fn cleanup_recovery_restores_reparsed_survivor_vectors() {
     assert_recovers_vector_crash(false, false);
     assert_recovers_vector_crash(true, false);

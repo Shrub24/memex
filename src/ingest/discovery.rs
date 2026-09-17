@@ -10,6 +10,7 @@ pub(super) struct TranscriptDiscovery {
     pub files_skipped: usize,
     pub total_bytes: u64,
     pub session_ids: HashSet<String>,
+    pub superseded_projections: HashSet<String>,
 }
 
 pub(super) fn discover_transcripts(
@@ -71,6 +72,39 @@ pub(super) fn discover_transcripts(
     if options.include_antigravity && full_scan {
         files.extend(crate::sources::antigravity::discover());
     }
+
+    // A watcher hint names the file that changed, not necessarily the projection
+    // that owns its conversation. Resolve ownership here for both scan modes.
+    let mut superseded_projections = HashSet::new();
+    for file in &mut files {
+        if file.source != SourceKind::Antigravity {
+            continue;
+        }
+        let Some(session) = crate::sources::antigravity::projection_session_id(&file.path) else {
+            continue;
+        };
+        let projections = crate::sources::antigravity::projection_paths(&session);
+        let mut winner = None;
+        for candidate in &projections {
+            if discovered_metadata(candidate)?.is_some_and(|metadata| metadata.is_file()) {
+                winner = Some(candidate.clone());
+                break;
+            }
+        }
+        if let Some(winner) = winner {
+            file.path = winner.clone();
+            if !excluder.is_excluded(&winner) {
+                superseded_projections.extend(
+                    projections
+                        .into_iter()
+                        .filter(|path| *path != winner)
+                        .map(|path| path.to_string_lossy().into_owned()),
+                );
+            }
+        }
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    files.dedup();
 
     state.preload(
         &files
@@ -148,6 +182,7 @@ pub(super) fn discover_transcripts(
         files_skipped: 0,
         total_bytes: 0,
         session_ids,
+        superseded_projections,
     };
     for observation in observations {
         match observation {
@@ -1135,6 +1170,20 @@ pub(super) fn prepare_refresh(
     files_skipped += transcripts.files_skipped;
     total_bytes += transcripts.total_bytes;
     let session_ids = transcripts.session_ids;
+    let mut superseded_paths =
+        index.source_paths_with_records(&transcripts.superseded_projections)?;
+    if !transcripts.superseded_projections.is_empty() && analytics_path(&paths.state).exists() {
+        let analytics = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+        superseded_paths.extend(analytics.source_paths(&transcripts.superseded_projections)?);
+    }
+    for path in transcripts.superseded_projections {
+        if state.contains_file(&path)? {
+            superseded_paths.insert(path);
+        }
+    }
+    for path in &superseded_paths {
+        state.delete_file(path);
+    }
 
     let Some(opencode) = discovery::discover_opencode(
         paths,
@@ -1279,6 +1328,7 @@ pub(super) fn prepare_refresh(
     vector_delete_paths.extend(opencode_database_paths_to_delete.iter().cloned());
     vector_delete_paths.extend(opencode_legacy_paths_to_delete.iter().cloned());
     vector_delete_paths.extend(missing_state_paths.iter().cloned());
+    vector_delete_paths.extend(superseded_paths.iter().cloned());
     // A newly excluded transcript loses its indexed records, so its embeddings have to go
     // with them; otherwise they stay live and keep matching semantic searches.
     vector_delete_paths.extend(excluded_state_paths.iter().cloned());
@@ -1296,6 +1346,7 @@ pub(super) fn prepare_refresh(
     delete_paths.extend(opencode_database_paths_to_delete.clone());
     delete_paths.extend(opencode_legacy_paths_to_delete.clone());
     delete_paths.extend(missing_state_paths);
+    delete_paths.extend(superseded_paths);
     delete_paths.extend(excluded_state_paths);
     delete_paths.extend(excluded_index_paths);
     delete_paths.extend(

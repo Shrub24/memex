@@ -35,7 +35,7 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
         SourceKind::Hermes => None,
         SourceKind::Jcode => config.jcode_resume_cmd.clone(),
         SourceKind::Muse => config.muse_resume_cmd.clone(),
-        SourceKind::Antigravity => None,
+        SourceKind::Antigravity => config.antigravity_resume_cmd.clone(),
     };
     configured.or_else(|| default_resume_template(source.label(), remote))
 }
@@ -70,6 +70,12 @@ pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
         }
         "grok" if remote || find_in_path("grok").is_some() => {
             Some("cd {cwd_shell} && grok --resume {session_id}".to_string())
+        }
+        "antigravity" if remote || find_in_path("agy").is_some() => {
+            Some("cd {cwd_shell} && agy --conversation {session_id}".to_string())
+        }
+        "antigravity" if find_in_path("antigravity").is_some() => {
+            Some("cd {cwd_shell} && antigravity --conversation {session_id}".to_string())
         }
         _ => None,
     }
@@ -165,6 +171,14 @@ mod tests {
         assert_eq!(
             default_resume_template("opencode", true).as_deref(),
             Some("opencode --session {session_id}")
+        );
+    }
+
+    #[test]
+    fn remote_antigravity_default_prefers_agy() {
+        assert_eq!(
+            default_resume_template("antigravity", true).as_deref(),
+            Some("cd {cwd_shell} && agy --conversation {session_id}")
         );
     }
 }

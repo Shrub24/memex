@@ -143,12 +143,10 @@ fn audit_files(source: SourceKind, files: &[PathBuf]) -> SourceAudit {
             // read transcript/message columns: count the file, skip content.
             continue;
         }
-        if source == SourceKind::Antigravity
-            && file.file_name().and_then(|name| name.to_str()) != Some("overview.txt")
-        {
-            // Antigravity conversation stores are SQLite. Audit must not
-            // reinterpret the database as JSON: count the file, skip content.
-            // overview.txt transcripts are JSONL and audit normally below.
+        if source == SourceKind::Antigravity && crate::sources::antigravity::is_db_path(file) {
+            // Conversation stores are SQLite; audit must not reinterpret the
+            // database as JSON. The overview.txt / transcript.jsonl projections
+            // are JSONL and audit normally below.
             continue;
         }
         let Ok(file) = std::fs::File::open(file) else {
