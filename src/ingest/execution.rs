@@ -72,6 +72,51 @@ pub(super) fn parse_antigravity_file(
     )
 }
 
+pub(super) fn parse_bob_task(
+    task: &FileTask,
+    tx_record: &RecordSender,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let source_path = task.path.to_string_lossy().to_string();
+    let parsed = match crate::sources::bob::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            legacy_turn_id: task.legacy_turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::Bob, 1);
+            tx_record.send(record)
+        },
+    ) {
+        Ok(parsed) => parsed,
+        // A changed task is scheduled for a delete-first replay. Skipping it now would
+        // publish the deletion without its replacement, so the refresh fails instead and
+        // the indexed records survive until the database reads again. A brand-new task
+        // has nothing to lose and simply waits for the next refresh.
+        Err(error) if task.delete_first() && is_not_found(&error) => {
+            return Err(anyhow!(
+                "Bob task {} became unreadable during its replay; refresh aborted to keep its indexed records ({error:#})",
+                task.path.display()
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Bob,
+        source_path,
+        parsed,
+    )
+}
+
 pub(super) fn parse_codex_session(
     task: &FileTask,
     include_reasoning: bool,
@@ -792,6 +837,13 @@ impl ParserContext<'_> {
                     self.next_id,
                     self.progress,
                 ),
+                SourceKind::Bob => parse_bob_task(
+                    task,
+                    self.records,
+                    self.updates,
+                    self.next_id,
+                    self.progress,
+                ),
             };
             finish_file_task(task, self.progress, skipped, result)
         };
@@ -1167,7 +1219,9 @@ pub(super) fn execute_refresh(
             records_embedded: 0,
             files_scanned,
             files_skipped,
-            diagnostics: Default::default(),
+            // Discovery diagnostics (an unreadable database, say) matter most when
+            // nothing else changed.
+            diagnostics: opencode_diagnostics,
         });
     }
 

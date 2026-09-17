@@ -281,6 +281,7 @@ pub(crate) fn start_journal_replay(
 fn journal_hints(
     journal: journal::ReplayHandle,
     state: &CheckpointSession,
+    options: &IngestOptions,
 ) -> Result<(
     Option<journal::JournalCursorUpdate>,
     Option<HashSet<PathBuf>>,
@@ -303,6 +304,15 @@ fn journal_hints(
                     .into_iter()
                     .map(PathBuf::from),
             );
+            // A Bob database with no indexed task yet has no checkpoint to sweep from;
+            // its first WAL-only commits still need a look on every journal refresh.
+            if options.include_bob {
+                paths.extend(
+                    crate::sources::bob::database_paths()
+                        .into_iter()
+                        .filter(|database| database.is_file()),
+                );
+            }
             crate::profiling::count!("journal.hints", paths.len());
             Some(paths)
         }
@@ -401,6 +411,7 @@ pub(super) fn file_identity(
     };
 
     FileIdentity {
+        bob_database: None,
         sqlite_wal: None,
         #[cfg(unix)]
         device: Some(metadata.dev()),
@@ -586,6 +597,195 @@ pub(super) struct OpenCodeDiscovery {
     pub files_skipped: usize,
     pub total_bytes: u64,
     pub deferred_pending_scopes: Vec<SessionScope>,
+}
+
+#[derive(Default)]
+pub(super) struct BobDiscovery {
+    pub tasks: Vec<FileTask>,
+    pub unchanged_identities: Vec<(String, FileIdentity)>,
+    pub files_scanned: usize,
+    pub files_skipped: usize,
+    pub total_bytes: u64,
+    /// Virtual paths whose task vanished from a readable database, or whose database
+    /// was itself deleted.
+    pub missing_paths: Vec<String>,
+    /// Databases that exist but could not be read this refresh. Their tasks must not be
+    /// deleted on any path (pending recovery included) because no replacement is coming.
+    pub unreadable_databases: Vec<PathBuf>,
+    pub diagnostics: crate::sources::ParseDiagnostics,
+}
+
+/// Bob keeps every task in one SQLite database; each task becomes the virtual file
+/// `<db>/<task_id>` so state, deletes and session metadata stay per source path. The
+/// database is never stat'ed as a transcript: task aggregates drive change detection,
+/// and `plan::classify_file` maps any growth to a delete-first replay of that task.
+///
+/// `selected` narrows a refresh to the databases a watcher saw change; `None` covers
+/// every configured database.
+pub(super) fn discover_bob(
+    options: &IngestOptions,
+    excluder: &PathExcluder,
+    state: &mut CheckpointSession,
+    selected: Option<&[crate::sources::SourceFile]>,
+) -> Result<BobDiscovery> {
+    let mut result = BobDiscovery::default();
+    if !options.include_bob {
+        return Ok(result);
+    }
+    let databases = match selected {
+        Some(files) => files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>(),
+        None => crate::sources::bob::database_paths(),
+    };
+    if databases.is_empty() {
+        return Ok(result);
+    }
+    crate::profiling::span!("bob.discover");
+    let parser_version =
+        crate::sources::index_state_version_for(SourceKind::Bob, options.include_reasoning);
+    let mut readable: Vec<PathBuf> = Vec::new();
+    let mut absent: Vec<PathBuf> = Vec::new();
+    let mut current: HashSet<String> = HashSet::new();
+    for database in databases {
+        let canonical_database =
+            crate::sources::bob::canonical_alias(&database).filter(|alias| *alias != database);
+        if excluder.is_excluded(&database)
+            || canonical_database
+                .as_ref()
+                .is_some_and(|alias| excluder.is_excluded(alias))
+        {
+            // Exclusion is authoritative even when the store is locked or unavailable.
+            // Reconcile all previously owned tasks without opening the database.
+            result.files_skipped += 1;
+            absent.push(database);
+            continue;
+        }
+        match database.metadata() {
+            // Like the generic sweep, a deletion counts only while the containing
+            // directory is still readable; an unmounted volume must not purge history,
+            // and a pending replay must wait for it like any other unavailable database.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if database.parent().is_some_and(|parent| parent.is_dir()) {
+                    absent.push(database);
+                } else {
+                    result.unreadable_databases.push(database);
+                }
+                continue;
+            }
+            Err(_) => {
+                result
+                    .diagnostics
+                    .unreadable_sources
+                    .push(database.to_string_lossy().into_owned());
+                result.files_skipped += 1;
+                result.unreadable_databases.push(database);
+                continue;
+            }
+            Ok(metadata) if !metadata.is_file() => continue,
+            Ok(_) => {}
+        }
+        let tasks = match crate::sources::bob::enumerate_tasks(&database) {
+            Ok(tasks) => tasks,
+            // A locked or mid-migration database must not fail the refresh; its indexed
+            // tasks stay until it can be read again.
+            Err(_) => {
+                result
+                    .diagnostics
+                    .unreadable_sources
+                    .push(database.to_string_lossy().into_owned());
+                result.files_skipped += 1;
+                result.unreadable_databases.push(database);
+                continue;
+            }
+        };
+        let keys = tasks
+            .iter()
+            .map(|task| {
+                crate::sources::bob::virtual_path(&database, &task.id)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        // Point lookups: Bob keys are a small share of the files table even on a full scan.
+        state.preload(&keys, FileLoadScope::Targeted)?;
+        current.extend(keys.iter().cloned());
+        // A virtual path cannot be canonicalized (`ENOTDIR`), so exclusions written against
+        // the real directory of a symlinked database are checked on the alias explicitly.
+        for (task, key) in tasks.iter().zip(keys) {
+            let path = PathBuf::from(&key);
+            let excluded = excluder.is_excluded(&path)
+                || canonical_database
+                    .as_ref()
+                    .is_some_and(|alias| excluder.is_excluded(&alias.join(&task.id)));
+            if excluded {
+                result.files_skipped += 1;
+                // The generic exclusion cleanup only sees the configured spelling.
+                if state.file(&key).is_some() {
+                    state.delete_file(&key);
+                    result.missing_paths.push(key);
+                }
+                continue;
+            }
+            result.files_scanned += 1;
+            result.total_bytes += task.message_count;
+            let identity = FileIdentity {
+                bob_database: Some(database.to_string_lossy().into_owned()),
+                prefix_sha256: Some(task.fingerprint()),
+                prefix_bytes: 1,
+                ..FileIdentity::default()
+            };
+            let size = task.message_count;
+            let mtime = (task.updated_at / 1000) as i64;
+            let change = plan::classify_file(
+                SourceKind::Bob,
+                size,
+                mtime,
+                &identity,
+                parser_version,
+                state.file(&key),
+            );
+            if change == FileChange::Unchanged {
+                result.files_skipped += 1;
+                result.unchanged_identities.push((key, identity));
+                continue;
+            }
+            result.tasks.push(FileTask {
+                path,
+                source: SourceKind::Bob,
+                offset: 0,
+                turn_id: 0,
+                legacy_turn_id: None,
+                size,
+                mtime,
+                change,
+                pending_tool_calls: HashMap::new(),
+                identity,
+                parser_version,
+                codex_metadata_offsets: None,
+                claude_background: None,
+            });
+        }
+        readable.push(database);
+    }
+    // The generic missing-file sweep skips virtual paths (they stat as `ENOTDIR`), so
+    // tasks deleted from a readable database, and every task of a deleted database, are
+    // reconciled here in one pass over the tracked keys.
+    if !readable.is_empty() || !absent.is_empty() {
+        for key in state.file_keys()? {
+            let Some((owner, _)) = crate::sources::bob::split_virtual_path(Path::new(&key)) else {
+                continue;
+            };
+            let vanished =
+                absent.contains(&owner) || (readable.contains(&owner) && !current.contains(&key));
+            if vanished {
+                state.delete_file(&key);
+                result.missing_paths.push(key);
+            }
+        }
+    }
+    Ok(result)
 }
 
 pub(super) fn discover_opencode(
@@ -1073,7 +1273,7 @@ pub(super) fn prepare_refresh(
                 && state_path.exists()
                 && !state.clears_files() =>
         {
-            let (cursor, hints) = journal_hints(journal, &state)?;
+            let (cursor, hints) = journal_hints(journal, &state, options)?;
             journal_cursor = cursor;
             match hints {
                 Some(hints) => match selection::resolve_dirty(options, &hints, &state)? {
@@ -1091,7 +1291,7 @@ pub(super) fn prepare_refresh(
             // The hints cannot be used here, but the cursor was captured before anything was
             // read, so it still describes what this refresh is about to cover. Dropping it
             // would make the next refresh replay an interval this scan already handled.
-            let (cursor, _) = journal_hints(journal, &state)?;
+            let (cursor, _) = journal_hints(journal, &state, options)?;
             journal_cursor = cursor;
             selected
         }
@@ -1141,8 +1341,12 @@ pub(super) fn prepare_refresh(
                 state.persisted_file_keys()?,
             )
         };
+        // Bob virtual paths sit "under" a database file, never under a walked directory.
+        let known = known
+            .into_iter()
+            .filter(|key| !crate::sources::bob::matches_path(key));
         Some((
-            directories::StampedWalk::new(previous, known.into_iter().map(PathBuf::from)),
+            directories::StampedWalk::new(previous, known.map(PathBuf::from)),
             fingerprint,
         ))
     } else {
@@ -1185,11 +1389,65 @@ pub(super) fn prepare_refresh(
         state.delete_file(path);
     }
 
+    // A narrowed refresh splits its database hints by owner: Bob commits only re-diff
+    // Bob tasks, and OpenCode never sees a Bob database.
+    let (bob_selected, opencode_selected) = match selected.as_ref() {
+        Some((_, databases)) => {
+            let (bob, opencode): (Vec<_>, Vec<_>) = databases
+                .iter()
+                .cloned()
+                .partition(|file| file.source == SourceKind::Bob);
+            (Some(bob), Some(opencode))
+        }
+        None => (None, None),
+    };
+    let discovery::BobDiscovery {
+        tasks: mut bob_tasks,
+        unchanged_identities: bob_unchanged_identities,
+        files_scanned: bob_files_scanned,
+        files_skipped: bob_files_skipped,
+        total_bytes: bob_total_bytes,
+        missing_paths: bob_missing_paths,
+        unreadable_databases: bob_unreadable_databases,
+        diagnostics: bob_diagnostics,
+    } = discovery::discover_bob(options, &excluder, &mut state, bob_selected.as_deref())?;
+    if let Some(pending) = &pending_recovery {
+        // Recovery replays every task named by the pending intent from scratch (its state
+        // was already dropped), so an unreadable database would publish the deletions
+        // with no replacement. Nothing has been committed yet: abort and retry once it
+        // reads again.
+        if let Some(path) = pending.source_paths.iter().find(|path| {
+            crate::sources::bob::split_virtual_path(Path::new(path))
+                .is_some_and(|(database, _)| bob_unreadable_databases.contains(&database))
+        }) {
+            anyhow::bail!(
+                "Bob task {path} has an interrupted replay to recover but its database cannot be read; refresh aborted so its indexed records survive"
+            );
+        }
+        // The same tasks look brand-new to discovery, yet their records may still be
+        // indexed: mark them as replacements so a parse failure refuses to publish the
+        // pending deletion on its own.
+        for task in &mut bob_tasks {
+            if pending
+                .source_paths
+                .iter()
+                .any(|path| *path == task.path.to_string_lossy())
+            {
+                task.change = FileChange::Replaced;
+            }
+        }
+    }
+    tasks.extend(bob_tasks);
+    unchanged_identities.extend(bob_unchanged_identities);
+    files_scanned += bob_files_scanned;
+    files_skipped += bob_files_skipped;
+    total_bytes += bob_total_bytes;
+
     let Some(opencode) = discovery::discover_opencode(
         paths,
         index,
         options,
-        selected.as_ref().map(|(_, databases)| databases.as_slice()),
+        opencode_selected.as_deref(),
         &mut state,
         &pending_recovery,
         &next_doc_id,
@@ -1217,7 +1475,8 @@ pub(super) fn prepare_refresh(
     let deferred_pending_scopes = opencode.deferred_pending_scopes;
     let opencode_ready_databases = opencode.ready_databases;
     let opencode_ready_owned_sessions = opencode.ready_owned_sessions;
-    let opencode_diagnostics = opencode.diagnostics;
+    let mut opencode_diagnostics = opencode.diagnostics;
+    opencode_diagnostics.merge(bob_diagnostics);
     let opencode_scope_targets = opencode.scope_targets;
     let opencode_session_cwds = opencode.session_cwds;
     let opencode_database_states = opencode.database_states;
@@ -1245,6 +1504,7 @@ pub(super) fn prepare_refresh(
             }
         }
     }
+    missing_state_paths.extend(bob_missing_paths);
 
     // Previously indexed records under now-excluded paths must be deleted even
     // when there is no ingest state entry for them (e.g. state loss or legacy runs).

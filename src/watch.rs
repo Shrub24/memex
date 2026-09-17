@@ -163,6 +163,9 @@ pub(crate) fn watch_roots(options: &IngestOptions) -> Vec<PathBuf> {
     if options.include_antigravity {
         roots.push(crate::sources::antigravity::sessions_root());
     }
+    if options.include_bob {
+        roots.extend(crate::sources::bob::roots());
+    }
     roots.sort();
     roots.dedup();
     roots
@@ -209,6 +212,7 @@ fn interesting_event_paths(event: &Event, excluder: &PathExcluder) -> (Vec<PathB
             .filter(|name| {
                 let database = path.with_file_name(name);
                 crate::sources::opencode::is_database_path(name)
+                    || crate::sources::bob::is_configured_database(&database)
                     || (crate::sources::antigravity::is_db_path(&database)
                         && crate::sources::antigravity::matches_path(&database.to_string_lossy()))
             })
@@ -389,7 +393,16 @@ pub(crate) fn sweep_candidates(
     let mut snapshot = reader.hot_files_since(cutoff)?;
     let mut databases: HashSet<String> = reader.header()?.opencode_databases.into_keys().collect();
     databases.extend(reader.sqlite_backed_paths()?);
-    snapshot.retain(|key, file| file.identity.sqlite_wal.is_none() && !databases.contains(key));
+    // Bob tasks are virtual `<db>/<task_id>` paths that cannot be stat'ed; their database
+    // joins the sweep instead, so WAL commits FSEvents defers while Bob holds the file open
+    // are still noticed.
+    snapshot.retain(|key, file| {
+        file.identity.sqlite_wal.is_none()
+            && file.identity.bob_database.is_none()
+            && !databases.contains(key)
+            && !crate::sources::bob::matches_path(key)
+    });
+    databases.extend(reader.bob_database_paths()?);
     Ok((snapshot, databases))
 }
 
@@ -697,10 +710,21 @@ impl WatchService {
             .unwrap_or_default()
             .as_secs()
             .saturating_sub(window.as_secs()) as i64;
-        let (snapshot, databases) = {
+        let (snapshot, mut databases) = {
             let reader = CheckpointReader::open(&paths.state.join("ingest.json"))?;
             sweep_candidates(&reader, cutoff)?
         };
+        // A Bob database with no indexed task yet has no state key to derive from; seed it
+        // from the configuration whenever this daemon watches its directory, so the first
+        // commits through a held-open WAL are noticed too.
+        for database in crate::sources::bob::database_paths() {
+            if database.is_file()
+                && crate::sources::bob::canonical_alias(&database)
+                    .is_some_and(|alias| self.watched.iter().any(|root| alias.starts_with(root)))
+            {
+                databases.insert(database.to_string_lossy().into_owned());
+            }
+        }
         self.hot_databases
             .retain(|path, _| databases.contains(path.to_string_lossy().as_ref()));
         for key in databases {
@@ -770,6 +794,7 @@ mod tests {
             include_jcode: true,
             include_muse: true,
             include_antigravity: true,
+            include_bob: true,
             exclude_patterns: Vec::new(),
             embeddings: false,
             backfill_embeddings: false,
@@ -882,6 +907,7 @@ mod tests {
         options.include_jcode = false;
         options.include_muse = false;
         options.include_antigravity = false;
+        options.include_bob = false;
         let roots = watch_roots(&options);
         assert_eq!(roots, options.claude_sources);
     }
@@ -1314,6 +1340,7 @@ mod tests {
             pending_tool_calls: HashMap::new(),
             codex_metadata_offsets: None,
             identity: FileIdentity {
+                bob_database: None,
                 sqlite_wal: None,
                 device: None,
                 inode: None,
@@ -1514,6 +1541,74 @@ mod tests {
         // Cold by mtime, so only its WAL backing makes it a candidate.
         assert!(databases.contains(&database));
         assert!(!files.contains_key(&database));
+    }
+
+    #[test]
+    fn hot_sweep_seeds_configured_bob_databases_under_watched_roots() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("memex");
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        let paths = Paths::new(Some(root.clone())).unwrap();
+        write_ingest_state(&root, HashMap::new());
+        let bob_dir = temp.path().join("bob");
+        std::fs::create_dir_all(&bob_dir).unwrap();
+        let database = bob_dir.join("bob.db");
+        std::fs::write(&database, "").unwrap();
+        let _env = EnvVarGuard::set_os(&[("MEMEX_BOB_DB", Some(database.as_os_str()))]);
+
+        let options = test_options();
+        let excluder = watch_excluder(&options).unwrap();
+        let mut service =
+            WatchService::new(vec![bob_dir.clone()], excluder, WatchConfig::default()).unwrap();
+        // No task indexed yet, but the database is configured and watched: it is polled.
+        assert_eq!(
+            service.hot_sweep_dirty(&paths, HOT_WINDOW).unwrap(),
+            vec![database.clone()]
+        );
+        assert!(
+            service
+                .hot_sweep_dirty(&paths, HOT_WINDOW)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(&database, "x").unwrap();
+        assert_eq!(
+            service.hot_sweep_dirty(&paths, HOT_WINDOW).unwrap(),
+            vec![database]
+        );
+    }
+
+    #[test]
+    fn sweep_candidates_skip_virtual_bob_task_paths_but_watch_their_database() {
+        use crate::state::checkpoint::CheckpointReader;
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let hot = temp.path().join("hot.jsonl");
+        std::fs::write(&hot, "{}\n").unwrap();
+        let database = temp.path().join("bob/db/bob.db");
+        let mut task = file_state_for(&hot);
+        task.mtime = i64::MAX / 2;
+        let task_key = database.join("task-1").to_string_lossy().into_owned();
+        write_ingest_state(
+            &paths.root,
+            HashMap::from([
+                (hot.to_string_lossy().into_owned(), task.clone()),
+                (task_key.clone(), task),
+            ]),
+        );
+
+        let reader = CheckpointReader::open(&paths.state.join("ingest.json")).unwrap();
+        let (files, databases) = sweep_candidates(&reader, 0).unwrap();
+
+        // Hot by mtime, but a virtual path can never be stat'ed by the sweep; the
+        // database it lives in is polled instead.
+        assert!(files.contains_key(&hot.to_string_lossy().into_owned()));
+        assert!(!files.contains_key(&task_key));
+        assert!(!databases.contains(&task_key));
+        assert!(databases.contains(&database.to_string_lossy().into_owned()));
     }
 
     #[test]

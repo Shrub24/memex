@@ -124,6 +124,10 @@ pub(crate) fn source_spec(filter: SourceFilter) -> SourceSpec {
             parser_version: crate::sources::muse::VERSIONS.usage,
             volatile_reuse_ms: no_volatile_reuse,
         },
+        SourceFilter::Bob => SourceSpec {
+            parser_version: crate::sources::bob::VERSIONS.usage,
+            volatile_reuse_ms: |_| Some(VOLATILE_DB_REUSE_MS),
+        },
         SourceFilter::Antigravity => SourceSpec {
             parser_version: crate::sources::antigravity::VERSIONS.usage,
             volatile_reuse_ms: no_volatile_reuse,
@@ -166,6 +170,7 @@ pub(crate) fn source_files(filter: SourceFilter) -> Vec<PathBuf> {
         SourceFilter::Jcode => crate::sources::jcode::usage_files(),
         SourceFilter::Muse => crate::sources::muse::usage_files(),
         SourceFilter::Antigravity => crate::sources::antigravity::usage_files(),
+        SourceFilter::Bob => crate::sources::bob::usage_files(),
     }
 }
 
@@ -481,6 +486,7 @@ pub(crate) fn parse_source_file(
             crate::sources::grok::parse_usage_file(path).map(FileParse::cacheable)
         }
         SourceFilter::Hermes => crate::sources::hermes::parse_usage_file(path),
+        SourceFilter::Bob => crate::sources::bob::parse_usage_file(path).map(FileParse::cacheable),
         SourceFilter::Jcode => {
             crate::sources::jcode::parse_usage_file(path).map(FileParse::cacheable)
         }
@@ -787,12 +793,35 @@ pub(crate) fn scan_antigravity(
     Ok(())
 }
 
+fn scan_bob(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
+    let files = crate::sources::bob::usage_files();
+    scan_files_cached(
+        SourceScan {
+            source: "bob",
+            parser_version: crate::sources::bob::VERSIONS.usage,
+            // WAL commits leave the main file's size and mtime untouched until a
+            // checkpoint, so metadata alone would serve stale spend indefinitely.
+            volatile_reuse_ms: |_| Some(VOLATILE_DB_REUSE_MS),
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        |path| crate::sources::bob::parse_usage_file(path).map(FileParse::cacheable),
+    );
+    Ok(())
+}
+
 pub(crate) type SourceScanner =
     fn(&mut Vec<UsageEvent>, &mut Vec<String>, Option<&mut UsageCache>) -> Result<()>;
 
 /// Scanner ordinals double as merge tiebreaks: partitions are laid out and merged in
 /// this order, reproducing the combined assembly's stable sort exactly.
-pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 13] = [
+pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 14] = [
     (SourceFilter::Claude, scan_claude),
     (SourceFilter::Codex, scan_codex),
     (SourceFilter::Opencode, scan_opencode),
@@ -806,6 +835,7 @@ pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 13] = [
     (SourceFilter::Jcode, scan_jcode),
     (SourceFilter::Muse, scan_muse),
     (SourceFilter::Antigravity, scan_antigravity),
+    (SourceFilter::Bob, scan_bob),
 ];
 
 /// Scan and reconcile one source partition. Shared by combined assembly and

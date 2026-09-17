@@ -172,6 +172,12 @@ struct IndexArgs {
     /// Skip indexing Antigravity conversations
     #[arg(long = "no-antigravity", default_value_t = false, hide = true)]
     no_antigravity: bool,
+    /// Index IBM Bob tasks from ~/.bob/db/bob.db [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    bob: bool,
+    /// Skip indexing IBM Bob tasks
+    #[arg(long = "no-bob", default_value_t = false, hide = true)]
+    no_bob: bool,
     /// Generate embeddings for semantic search during indexing
     #[arg(long, help_heading = "Embeddings")]
     embeddings: bool,
@@ -2299,6 +2305,7 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         include_jcode: index.source_enabled(IndexSource::Jcode),
         include_muse: index.source_enabled(IndexSource::Muse),
         include_antigravity: index.source_enabled(IndexSource::Antigravity),
+        include_bob: index.source_enabled(IndexSource::Bob),
         exclude_patterns: excludes,
         embeddings,
         backfill_embeddings: false,
@@ -2359,6 +2366,9 @@ fn run_index_selection(
             "indexed {} records across {} files (skipped {})",
             report.records_added, report.files_scanned, report.files_skipped
         );
+    }
+    for path in &report.diagnostics.unreadable_sources {
+        eprintln!("warning: skipped unreadable source {path}; its indexed records are kept");
     }
     if print_diagnostics && !report.diagnostics.is_empty() {
         println!(
@@ -2632,7 +2642,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     let memory_embedded = embed_memory(&paths, model_choice, &embed_runtime)?;
     progress.finish();
     println!(
-        "embedded {} conversation vectors and {} memory section vectors (claude {}, codex {}, opencode {}, cursor {}, pi {}, openclaw {}, copilot {}, jcode {}, muse {}, grok {})",
+        "embedded {} conversation vectors and {} memory section vectors (claude {}, codex {}, opencode {}, cursor {}, pi {}, openclaw {}, copilot {}, jcode {}, muse {}, grok {}, bob {})",
         embedded_total,
         memory_embedded,
         embedded_counts[crate::types::SourceKind::Claude.idx()],
@@ -2645,6 +2655,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
         embedded_counts[crate::types::SourceKind::Jcode.idx()],
         embedded_counts[crate::types::SourceKind::Muse.idx()],
         embedded_counts[crate::types::SourceKind::Grok.idx()],
+        embedded_counts[crate::types::SourceKind::Bob.idx()],
     );
 
     std::io::stdout().flush().ok();
@@ -5815,8 +5826,14 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Jcode => "jcode",
         crate::types::SourceKind::Muse => "muse",
         crate::types::SourceKind::Antigravity => "antigravity",
+        crate::types::SourceKind::Bob => "bob",
     };
     let source_path = &record.source_path;
+    if record.source == crate::types::SourceKind::Bob {
+        return Err(anyhow!(
+            "sharing is not supported for Bob tasks: {source_path} is a database entry, not a transcript file"
+        ));
+    }
 
     // Build agentexport command
     let mut cmd = std::process::Command::new("agentexport");
@@ -7141,6 +7158,9 @@ fn build_index_command_args(
     }
     if !index.muse || index.no_muse {
         args.push("--no-muse".to_string());
+    }
+    if !index.bob || index.no_bob {
+        args.push("--no-bob".to_string());
     }
     if let Some(listen) = mcp_listen {
         args.push("--mcp".to_string());
@@ -8558,6 +8578,7 @@ mod tests {
             jcode: false,
             muse: false,
             antigravity: false,
+            bob: false,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
@@ -8568,6 +8589,7 @@ mod tests {
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
+            no_bob: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -8595,6 +8617,7 @@ mod tests {
         assert!(args.contains(&"--no-grok".to_string()));
         assert!(args.contains(&"--no-jcode".to_string()));
         assert!(args.contains(&"--no-muse".to_string()));
+        assert!(args.contains(&"--no-bob".to_string()));
     }
 
     #[test]
@@ -8617,6 +8640,7 @@ mod tests {
             jcode: true,
             muse: true,
             antigravity: true,
+            bob: true,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
@@ -8627,6 +8651,7 @@ mod tests {
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
+            no_bob: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -8670,6 +8695,7 @@ mod tests {
             jcode: true,
             muse: true,
             antigravity: true,
+            bob: true,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
@@ -8680,6 +8706,7 @@ mod tests {
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
+            no_bob: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -8725,6 +8752,7 @@ mod tests {
             jcode: true,
             muse: true,
             antigravity: true,
+            bob: true,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
@@ -8735,6 +8763,7 @@ mod tests {
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
+            no_bob: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
