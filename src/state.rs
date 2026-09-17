@@ -199,12 +199,33 @@ impl ScanCache {
     }
 }
 
+/// Per-session high-water mark derived from the OpenCode v2 `session_message` table.
+///
+/// The OpenCode v2 event stream is event-sourced, so `event` rowid cursors cannot detect
+/// in-place message updates.  `session_message` is a mutable projection keyed by a sparse
+/// `(session_id, seq)` pair, so planning instead remembers the highest `seq` and the newest
+/// `time_updated` observed for each session, plus its row count to detect middle-row
+/// deletions. When available, `event_sequence` supplies the durable session revision.
+/// Older schemas without that revision still require an index rebuild for replacements that
+/// preserve these values or non-maximal timestamp edits.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpencodeSessionCursor {
+    pub max_seq: i64,
+    pub max_time_updated: i64,
+    #[serde(default)]
+    pub row_count: i64,
+    #[serde(default)]
+    pub event_sequence: Option<i64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpencodeDatabaseState {
     pub parser_version: u32,
     pub event_rowid: i64,
     pub event_id: Option<String>,
     pub owned_session_ids: HashSet<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub session_cursors: HashMap<String, OpencodeSessionCursor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -475,6 +496,16 @@ mod tests {
     }
 
     #[test]
+    fn opencode_cursor_without_row_count_remains_compatible() {
+        let cursor: OpencodeSessionCursor =
+            serde_json::from_str(r#"{"max_seq":3,"max_time_updated":4}"#).unwrap();
+        assert_eq!(cursor.row_count, 0);
+        assert_eq!(cursor.event_sequence, None);
+        assert_eq!(cursor.max_seq, 3);
+        assert_eq!(cursor.max_time_updated, 4);
+    }
+
+    #[test]
     fn ingest_state_without_opencode_databases_remains_compatible() {
         let state: IngestState =
             serde_json::from_str(r#"{"next_doc_id":9,"files":{}}"#).expect("legacy state");
@@ -486,6 +517,15 @@ mod tests {
             event_rowid: 12,
             event_id: Some("event".to_string()),
             owned_session_ids: HashSet::from(["session".to_string()]),
+            session_cursors: HashMap::from([(
+                "session".to_string(),
+                OpencodeSessionCursor {
+                    max_seq: 3,
+                    max_time_updated: 4,
+                    row_count: 3,
+                    event_sequence: Some(5),
+                },
+            )]),
         };
         let round_trip = serde_json::to_string(&database).expect("serialize database state");
         assert_eq!(

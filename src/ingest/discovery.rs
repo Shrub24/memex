@@ -776,6 +776,7 @@ pub(super) fn discover_opencode(
                     event_rowid: database.scan.cursor.event_rowid,
                     event_id: database.scan.cursor.event_id.clone(),
                     owned_session_ids,
+                    session_cursors: database.scan.session_cursors.clone(),
                 },
             );
         }
@@ -815,28 +816,33 @@ pub(super) fn discover_opencode(
         } else {
             Vec::new()
         };
+        // A healthy v2 database owns its root's history, including sessions deleted
+        // before this scan. Frozen JSON must not recreate those absent sessions.
+        // Only ready databases qualify, preserving fallback after a database failure.
+        let v2_roots = opencode_ready_databases
+            .iter()
+            .filter(|database| database.scan.v2)
+            .filter_map(|database| database.path.parent().map(Path::to_path_buf))
+            .collect::<HashSet<_>>();
+        let database_owns_legacy = |path: &Path| {
+            path.ancestors()
+                .nth(3)
+                .is_some_and(|root| v2_roots.contains(root))
+                || path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|session| owner_by_session.contains_key(session))
+        };
         let legacy_candidates = opencode_files
             .iter()
-            .filter(|file| {
-                !excluder.is_excluded(&file.path)
-                    && file
-                        .path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|session| owner_by_session.contains_key(session))
-            })
+            .filter(|file| !excluder.is_excluded(&file.path) && database_owns_legacy(&file.path))
             .map(|file| file.path.to_string_lossy().into_owned())
             .collect::<HashSet<_>>();
         state.preload(
             &opencode_files
                 .iter()
                 .filter(|file| {
-                    !excluder.is_excluded(&file.path)
-                        && !file
-                            .path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .is_some_and(|session| owner_by_session.contains_key(session))
+                    !excluder.is_excluded(&file.path) && !database_owns_legacy(&file.path)
                 })
                 .map(|file| file.path.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
@@ -857,11 +863,7 @@ pub(super) fn discover_opencode(
                 files_skipped += 1;
                 continue;
             }
-            let session_id = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default();
-            if owner_by_session.contains_key(session_id) {
+            if database_owns_legacy(&path) {
                 let path_key = path.to_string_lossy().to_string();
                 if state.contains_file(&path_key)? || legacy_cleanup.contains(&path_key) {
                     state.delete_file(&path_key);

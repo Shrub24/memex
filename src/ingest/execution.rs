@@ -907,26 +907,43 @@ pub(super) fn prehydrate_opencode_database(
     let mut diagnostics = crate::sources::ParseDiagnostics::default();
     let connection = crate::sources::opencode::open_database_for_sessions(path)?;
     let mut writer = std::io::BufWriter::new(spool.as_file_mut());
-    for session_id in session_ids {
-        let output = crate::sources::opencode::parse_session_records(
-            &connection,
-            path,
-            session_id,
-            crate::sources::IndexParseState::default(),
-            next_doc_id,
-            |record| {
-                serde_json::to_writer(&mut writer, &record)?;
-                writer.write_all(b"\n")?;
-                Ok(())
-            },
-        )
-        .with_context(|| {
-            format!(
-                "hydrate OpenCode session `{session_id}` from {}",
-                path.display()
-            )
-        })?;
-        diagnostics.merge(output.diagnostics);
+    {
+        let mut emit = |record: Record| -> Result<()> {
+            serde_json::to_writer(&mut writer, &record)?;
+            writer.write_all(b"\n")?;
+            Ok(())
+        };
+        for session_id in session_ids {
+            // Per-session dispatch: v2 sessions hydrate from `session_message` (plus the v1
+            // union), everything else from the v1 projection.  The connection and schema are
+            // shared for the whole database.
+            let output = if scan.v2_session_ids.contains(session_id) {
+                crate::sources::opencode::parse_session_records_v2(
+                    &connection,
+                    path,
+                    session_id,
+                    crate::sources::IndexParseState::default(),
+                    next_doc_id,
+                    &mut emit,
+                )
+            } else {
+                crate::sources::opencode::parse_session_records(
+                    &connection,
+                    path,
+                    session_id,
+                    crate::sources::IndexParseState::default(),
+                    next_doc_id,
+                    &mut emit,
+                )
+            }
+            .with_context(|| {
+                format!(
+                    "hydrate OpenCode session `{session_id}` from {}",
+                    path.display()
+                )
+            })?;
+            diagnostics.merge(output.diagnostics);
+        }
     }
     writer.flush()?;
     drop(writer);

@@ -222,9 +222,18 @@ fn drop_outdated_directories(connection: &Connection) -> Result<()> {
 }
 
 fn configure_writer(connection: &Connection) -> Result<()> {
+    configure_storage(connection)?;
+    ensure_discovery_schema(connection)
+}
+
+fn ensure_discovery_schema(connection: &Connection) -> Result<()> {
     drop_outdated_directories(connection)?;
     connection.execute_batch(DIRECTORIES_SCHEMA)?;
     connection.execute_batch(JOURNAL_SCHEMA)?;
+    Ok(())
+}
+
+fn configure_storage(connection: &Connection) -> Result<()> {
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
     connection.pragma_update(None, "fullfsync", false)?;
@@ -531,12 +540,16 @@ pub(super) fn open_writer(
         Authority::Marker { .. } => unreachable!(),
     };
     let mut connection = open_connection(state_path, true, true)?;
-    configure_writer(&connection)?;
+    configure_storage(&connection)?;
     let state: IngestState = serde_json::from_value(value.clone())?;
     failure.check("before_import")?;
     {
         let transaction = connection.transaction()?;
         transaction.execute_batch(SCHEMA)?;
+        // Bootstrap must leave either an empty database or a complete metadata schema.
+        // Auxiliary tables committed before this transaction make an interrupted first
+        // startup look like an unexplained database on retry.
+        ensure_discovery_schema(&transaction)?;
         let columns: i64 = transaction.query_row(
             "SELECT count(*) FROM pragma_table_info('metadata') WHERE name IN ('pending_json','scancache_json')", [], |row| row.get(0),
         )?;

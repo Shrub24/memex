@@ -322,7 +322,7 @@ fn daemon_hands_off_stable_executable_preserving_arguments_and_environment() {
 }
 
 #[test]
-fn daemon_mcp_flags_override_the_configured_enablement() {
+fn daemon_no_mcp_flag_overrides_configured_enablement() {
     let dirs = TestDirs::new();
     let web = free_address();
     let reserved_mcp = TcpListener::bind("127.0.0.1:0").expect("occupy configured MCP socket");
@@ -337,7 +337,11 @@ fn daemon_mcp_flags_override_the_configured_enablement() {
     web_only.stop();
     drop(reserved_mcp);
     assert_listener_closes(web);
+}
 
+#[test]
+fn daemon_mcp_flag_overrides_configured_disablement() {
+    let dirs = TestDirs::new();
     let configured_for_flag = free_address();
     dirs.write_config(&format!(
         "auto_index_on_search = false\nindex_service_mcp = false\n\n[mcp]\nlisten = '{configured_for_flag}'\n"
@@ -346,7 +350,11 @@ fn daemon_mcp_flags_override_the_configured_enablement() {
     wait_for_health(&mut enabled, configured_for_flag, "memex-mcp");
     enabled.stop();
     assert_listener_closes(configured_for_flag);
+}
 
+#[test]
+fn daemon_mcp_listen_flag_overrides_configured_disablement() {
+    let dirs = TestDirs::new();
     let explicit_mcp = free_address();
     dirs.write_config("auto_index_on_search = false\nindex_service_mcp = false\n");
     let mut mcp_only = ChildGuard::daemon(&dirs, &["--mcp-listen", &explicit_mcp.to_string()]);

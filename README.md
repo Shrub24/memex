@@ -294,6 +294,20 @@ legacy JSON storage. To use one or more alternate data roots, set
 `OPENCODE_DATA_DIR` to a comma-separated list of directories before running
 the installed `memex` binary.
 
+OpenCode SQLite support includes legacy `message`/`part` storage and v2
+`session_message` projections with either `session_v2` or `session` metadata
+(the latter tested against upstream commit `5a833585`). When a v2 projection
+exists, it is authoritative for transcripts, session inventory, and usage.
+Frozen legacy rows are not merged back into it: missing rows may have been
+reverted or deleted. Incomplete migrations without an explicit ownership
+marker are therefore not reconstructed from legacy tables. A readable v2
+database also supersedes frozen legacy JSON under the same data root.
+
+V2 incremental scans track message count and maximum sequence/update time,
+plus the durable per-session event revision when `event_sequence` is available.
+Without that revision, same-count replacements or edits that leave both maxima
+unchanged require an index rebuild; direct middle-row deletions are detected.
+
 The default scan indexes Pi sessions from `~/.pi/agent/sessions` and Oh My Pi sessions
 separately from `~/.omp/agent/sessions` plus named profile session directories.
 

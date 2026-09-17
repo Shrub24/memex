@@ -1444,6 +1444,90 @@ fn pending_session_scopes_retain_database_state_for_recovery() {
 }
 
 #[test]
+fn opencode_v2_discovery_persists_session_cursors() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("opencode.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute_batch(
+        "CREATE TABLE session (
+            id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+            time_created INTEGER, time_updated INTEGER
+         );
+         CREATE TABLE message (
+            id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT
+         );
+         CREATE TABLE part (
+            id TEXT PRIMARY KEY, message_id TEXT, data TEXT
+         );
+         CREATE TABLE event (id TEXT NOT NULL, aggregate_id TEXT NOT NULL);
+         CREATE TABLE session_v2 (
+            id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
+         );
+         CREATE TABLE session_message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+            seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL, data TEXT NOT NULL
+         );
+         INSERT INTO session VALUES ('s_child', NULL, '/repo', 1, 2);
+         INSERT INTO message VALUES ('m_1', 's_child', 100, '{\"role\":\"assistant\"}');
+         INSERT INTO part VALUES ('p_1', 'm_1', '{\"type\":\"text\",\"text\":\"hi\"}');
+         INSERT INTO event VALUES ('e_1', 's_child');
+         INSERT INTO session_v2 VALUES ('s_child', NULL, '/repo', 1, 200);
+         INSERT INTO session_message VALUES ('sm_1', 's_child', 'user', 1, 100, 100, '{\"text\":\"hello\"}');
+         INSERT INTO session_message VALUES ('sm_2', 's_child', 'assistant', 2, 200, 200, '{\"text\":\"hi\"}');",
+    )
+    .unwrap();
+    drop(db);
+
+    let _env = EnvVarGuard::set_os(&[("OPENCODE_DATA_DIR", Some(temp.path().as_os_str()))]);
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::Gemma);
+    options.include_opencode = true;
+    let state_path = paths.state.join("ingest.json");
+    let mut state = CheckpointSession::open(&state_path, &lease, true, None).unwrap();
+    let next_doc_id = Arc::new(AtomicU64::new(1));
+
+    let discovery = discovery::discover_opencode(
+        &paths,
+        &index,
+        &options,
+        None,
+        &mut state,
+        &None,
+        &next_doc_id,
+    )
+    .unwrap()
+    .expect("opencode discovery");
+
+    // The discovery write-through must copy the scan's per-session cursors verbatim so the next
+    // incremental run can detect in-place `session_message` changes.
+    let key = db_path.to_string_lossy().to_string();
+    let persisted = discovery
+        .database_states
+        .get(&key)
+        .expect("persisted database state");
+    assert_eq!(
+        persisted.parser_version,
+        crate::sources::opencode::DATABASE_STATE_VERSION
+    );
+    assert!(persisted.owned_session_ids.contains("s_child"));
+    assert_eq!(
+        persisted.session_cursors["s_child"],
+        crate::state::OpencodeSessionCursor {
+            max_seq: 2,
+            max_time_updated: 200,
+            row_count: 2,
+            event_sequence: None,
+        }
+    );
+}
+
+#[test]
 fn stale_opencode_spools_are_cleaned_without_touching_other_state() {
     let temp = tempfile::tempdir().unwrap();
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
@@ -1773,6 +1857,264 @@ fn modern_opencode_database_ingests_once_and_skips_noop_hydration() {
     assert_eq!(index.doc_count().expect("remaining document count"), 1);
     let state = IngestState::load(&paths.state.join("ingest.json")).expect("load ingest state");
     assert!(!state.opencode_databases.contains_key(&source_path));
+}
+
+#[test]
+fn opencode_v2_dispatch_hydrates_v2_only_session_and_rescan_is_noop() {
+    use tantivy::Directory;
+
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("opencode.db");
+    let db = rusqlite::Connection::open(&db_path).expect("open OpenCode v2 fixture");
+    db.execute_batch(
+        "CREATE TABLE session (
+            id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+            time_created INTEGER, time_updated INTEGER
+         );
+         CREATE TABLE message (
+            id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT
+         );
+         CREATE TABLE part (
+            id TEXT PRIMARY KEY, message_id TEXT, data TEXT
+         );
+         CREATE TABLE event (id TEXT NOT NULL, aggregate_id TEXT NOT NULL);
+         CREATE TABLE session_v2 (
+            id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
+         );
+         CREATE TABLE session_message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+            seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL, data TEXT NOT NULL
+         );
+         INSERT INTO session_v2 VALUES ('s_v2only', NULL, '/repo/v2', 1, 200);
+         INSERT INTO session_message VALUES ('sm_user', 's_v2only', 'user', 1, 100, 100, '{\"text\":\"v2 only queryable\"}');
+         INSERT INTO session_message VALUES ('sm_assistant', 's_v2only', 'assistant', 2, 200, 200, '{\"content\":[{\"type\":\"text\",\"text\":\"assistant reply\"},{\"type\":\"tool\",\"name\":\"bash\",\"state\":{\"input\":{\"cmd\":\"ls\"},\"metadata\":{\"output\":\"ok\"}}}]}');",
+    )
+    .expect("write OpenCode v2 fixture");
+    drop(db);
+    let _env = EnvVarGuard::set_os(&[("OPENCODE_DATA_DIR", Some(tmp.path().as_os_str()))]);
+    let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+    paths.ensure_dirs().expect("ensure paths");
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::Gemma);
+    options.include_opencode = true;
+
+    let first = ingest_all(&paths, &index, &options, &ingest_lease(&paths));
+    assert_eq!(first.expect("initial v2 ingest").records_added, 3);
+    let records = index
+        .records_by_session_id("s_v2only")
+        .expect("v2-only records");
+    assert_eq!(records.len(), 3);
+    assert!(
+        records
+            .iter()
+            .any(|record| record.text == "v2 only queryable")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.text == "assistant reply")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.tool_name.as_deref() == Some("bash"))
+    );
+
+    let metadata_before = index
+        .index
+        .directory()
+        .atomic_read(Path::new("meta.json"))
+        .unwrap();
+    let second = ingest_all(&paths, &index, &options, &ingest_lease(&paths));
+    assert_eq!(second.expect("no-op v2 rescan").records_added, 0);
+    assert_eq!(
+        metadata_before,
+        index
+            .index
+            .directory()
+            .atomic_read(Path::new("meta.json"))
+            .unwrap()
+    );
+}
+
+#[test]
+fn opencode_shared_history_revert_and_session_deletion_remove_indexed_records() {
+    let _guard = env_lock();
+    for separate_session_table in [true, false] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("opencode.db");
+        let db = rusqlite::Connection::open(&db_path).expect("open shared history fixture");
+        // Keep stale rows after metadata deletion to exercise inventory ownership,
+        // independently of whether this database's connection enables cascades.
+        db.execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("retain frozen legacy rows");
+        db.execute_batch(include_str!(
+            "../../tests/fixtures/opencode/upstream-5a833585.sql"
+        ))
+        .expect("load pinned upstream schema");
+        db.execute_batch(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+             VALUES ('project', '/repo/shared', 1, 1, '[]');
+             INSERT INTO session
+                (id, project_id, slug, directory, title, version, time_created, time_updated)
+             VALUES ('ses_shared', 'project', 'ses_shared', '/repo/shared', 'ses_shared', '2', 1, 300);",
+        )
+        .expect("insert session metadata");
+        if separate_session_table {
+            db.execute_batch("CREATE TABLE session_v2 AS SELECT * FROM session;")
+                .expect("create older metadata layout");
+        }
+        for (id, seq, text) in [
+            ("msg_1", 1, "retained history"),
+            ("msg_2", 2, "reverted middle history"),
+            ("msg_3", 3, "reverted tail history"),
+        ] {
+            db.execute(
+                "INSERT INTO message VALUES (?1, 'ses_shared', ?2, ?2, ?3)",
+                rusqlite::params![id, seq * 100, r#"{"role":"user"}"#],
+            )
+            .expect("insert frozen legacy message");
+            db.execute(
+                "INSERT INTO part VALUES (?1, ?1, 'ses_shared', ?2, ?2, ?3)",
+                rusqlite::params![
+                    id,
+                    seq * 100,
+                    serde_json::json!({"type": "text", "text": text}).to_string()
+                ],
+            )
+            .expect("insert frozen legacy part");
+            db.execute(
+                "INSERT INTO session_message VALUES (?1, 'ses_shared', 'user', ?2, ?3, ?3, ?4)",
+                rusqlite::params![
+                    id,
+                    seq,
+                    seq * 100,
+                    serde_json::json!({"text": text}).to_string()
+                ],
+            )
+            .expect("insert projected message");
+            let legacy_session = tmp.path().join("storage/message/ses_shared");
+            let legacy_parts = tmp.path().join("storage/part").join(id);
+            fs::create_dir_all(&legacy_session).expect("create frozen JSON session");
+            fs::create_dir_all(&legacy_parts).expect("create frozen JSON parts");
+            fs::write(
+                legacy_session.join(format!("{id}.json")),
+                serde_json::json!({
+                    "id": id,
+                    "sessionID": "ses_shared",
+                    "role": "user",
+                    "time": {"created": seq * 100},
+                    "tokens": {"input": 7, "output": 3}
+                })
+                .to_string(),
+            )
+            .expect("write frozen JSON message");
+            fs::write(
+                legacy_parts.join("part.json"),
+                serde_json::json!({"type": "text", "text": text}).to_string(),
+            )
+            .expect("write frozen JSON part");
+        }
+        let _env = EnvVarGuard::set_os(&[("OPENCODE_DATA_DIR", Some(tmp.path().as_os_str()))]);
+        assert_eq!(
+            crate::sources::opencode::usage_files(),
+            vec![db_path.clone()]
+        );
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("ensure paths");
+        let index = open_search_index(&paths);
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.include_opencode = true;
+        ingest_all(&paths, &index, &options, &ingest_lease(&paths)).expect("initial ingest");
+        assert_eq!(index.records_by_session_id("ses_shared").unwrap().len(), 3);
+
+        // OpenCode's committed revert removes only the projection tail. The frozen
+        // legacy messages remain and must never be used to fill the missing IDs.
+        db.execute("DELETE FROM session_message WHERE seq > 1", [])
+            .expect("commit projected revert");
+        ingest_all(&paths, &index, &options, &ingest_lease(&paths)).expect("ingest revert");
+        let records = index.records_by_session_id("ses_shared").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text, "retained history");
+
+        let cold_paths = Paths::new(Some(tmp.path().join("cold-memex"))).expect("cold paths");
+        cold_paths.ensure_dirs().expect("ensure cold paths");
+        let cold_index = open_search_index(&cold_paths);
+        ingest_all(
+            &cold_paths,
+            &cold_index,
+            &options,
+            &ingest_lease(&cold_paths),
+        )
+        .expect("cold ingest after revert");
+        let records = cold_index.records_by_session_id("ses_shared").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text, "retained history");
+
+        let metadata_table = if separate_session_table {
+            "session_v2"
+        } else {
+            "session"
+        };
+        db.execute(
+            &format!("DELETE FROM {metadata_table} WHERE id = 'ses_shared'"),
+            [],
+        )
+        .expect("delete projected session");
+        ingest_all(&paths, &index, &options, &ingest_lease(&paths)).expect("ingest deletion");
+        assert_eq!(index.doc_count().unwrap(), 0);
+
+        let deleted_paths =
+            Paths::new(Some(tmp.path().join("deleted-memex"))).expect("deleted session paths");
+        deleted_paths.ensure_dirs().expect("ensure deleted paths");
+        let deleted_index = open_search_index(&deleted_paths);
+        ingest_all(
+            &deleted_paths,
+            &deleted_index,
+            &options,
+            &ingest_lease(&deleted_paths),
+        )
+        .expect("cold ingest after deletion");
+        assert_eq!(deleted_index.doc_count().unwrap(), 0);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM message", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            3,
+            "legacy rows stayed frozen throughout the regression"
+        );
+        assert_eq!(
+            crate::sources::opencode::usage_files(),
+            vec![db_path.clone()]
+        );
+
+        // A standalone JSON root is still supported. Removing the authoritative
+        // database from discovery makes the same fixture valid legacy input.
+        drop(db);
+        fs::rename(&db_path, tmp.path().join("archived.sqlite"))
+            .expect("remove authoritative database from discovery");
+        assert_eq!(crate::sources::opencode::usage_files().len(), 3);
+        let legacy_paths = Paths::new(Some(tmp.path().join("legacy-memex"))).expect("legacy paths");
+        legacy_paths.ensure_dirs().expect("ensure legacy paths");
+        let legacy_index = open_search_index(&legacy_paths);
+        ingest_all(
+            &legacy_paths,
+            &legacy_index,
+            &options,
+            &ingest_lease(&legacy_paths),
+        )
+        .expect("ingest standalone JSON root");
+        assert_eq!(
+            legacy_index
+                .records_by_session_id("ses_shared")
+                .unwrap()
+                .len(),
+            3
+        );
+    }
 }
 
 #[test]
