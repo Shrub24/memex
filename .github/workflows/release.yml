@@ -90,10 +90,10 @@ jobs:
             memex-*.sha256
 
   build-qt-appimage:
-    # Oldest supported distro for a low glibc baseline; do NOT move this to
-    # Fedora (see apps/qt/README.md). Qt itself comes from install-qt-action
-    # because system Qt on 22.04 is too old for the app.
-    runs-on: ubuntu-22.04
+    # ONNX Runtime 1.28's Linux binaries require glibc 2.38+, making Ubuntu
+    # 24.04 the oldest supported Ubuntu LTS for the bundled memex CLI.
+    # Qt itself comes from install-qt-action rather than the system packages.
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7
