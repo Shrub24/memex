@@ -19,10 +19,11 @@ pub enum SourceKind {
     Muse,
     Antigravity,
     Bob,
+    Zcode,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 14] = [
+    pub const ALL: [SourceKind; 15] = [
         SourceKind::Claude,
         SourceKind::Codex,
         SourceKind::Opencode,
@@ -37,6 +38,7 @@ impl SourceKind {
         SourceKind::Muse,
         SourceKind::Antigravity,
         SourceKind::Bob,
+        SourceKind::Zcode,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -56,6 +58,7 @@ impl SourceKind {
             SourceKind::Muse => 11,
             SourceKind::Antigravity => 12,
             SourceKind::Bob => 13,
+            SourceKind::Zcode => 14,
         }
     }
 
@@ -75,6 +78,7 @@ impl SourceKind {
             11 => Some(SourceKind::Muse),
             12 => Some(SourceKind::Antigravity),
             13 => Some(SourceKind::Bob),
+            14 => Some(SourceKind::Zcode),
             _ => None,
         }
     }
@@ -95,6 +99,7 @@ impl SourceKind {
             SourceKind::Muse => "muse",
             SourceKind::Antigravity => "antigravity",
             SourceKind::Bob => "bob",
+            SourceKind::Zcode => "zcode",
         }
     }
 
@@ -114,6 +119,7 @@ impl SourceKind {
             SourceKind::Muse => "muse",
             SourceKind::Antigravity => "antigravity",
             SourceKind::Bob => "bob",
+            SourceKind::Zcode => "zcode",
         }
     }
 
@@ -137,6 +143,7 @@ impl SourceKind {
             "muse" => Some(SourceKind::Muse),
             "antigravity" => Some(SourceKind::Antigravity),
             "bob" => Some(SourceKind::Bob),
+            "zcode" => Some(SourceKind::Zcode),
             _ => None,
         }
     }
@@ -161,6 +168,7 @@ pub enum SourceFilter {
     Muse,
     Antigravity,
     Bob,
+    Zcode,
 }
 
 impl SourceFilter {
@@ -180,6 +188,7 @@ impl SourceFilter {
             SourceFilter::Muse => source == SourceKind::Muse,
             SourceFilter::Antigravity => source == SourceKind::Antigravity,
             SourceFilter::Bob => source == SourceKind::Bob,
+            SourceFilter::Zcode => source == SourceKind::Zcode,
         }
     }
 
@@ -199,6 +208,7 @@ impl SourceFilter {
             SourceFilter::Muse => &["muse"],
             SourceFilter::Antigravity => &["antigravity"],
             SourceFilter::Bob => &["bob"],
+            SourceFilter::Zcode => &["zcode"],
         }
     }
 
@@ -218,6 +228,7 @@ impl SourceFilter {
             SourceFilter::Muse => "muse",
             SourceFilter::Antigravity => "antigravity",
             SourceFilter::Bob => "bob",
+            SourceFilter::Zcode => "zcode",
         }
     }
 }

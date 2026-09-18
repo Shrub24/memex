@@ -33,6 +33,7 @@ enum Shape {
     Muse,
     Antigravity,
     Bob,
+    Zcode,
 }
 
 struct Root {
@@ -133,6 +134,13 @@ fn roots(options: &IngestOptions) -> Vec<Root> {
                 .map(|root| Root::new(root, Shape::Bob)),
         );
     }
+    if options.include_zcode {
+        roots.extend(
+            sources::zcode::db_dirs()
+                .into_iter()
+                .map(|root| Root::new(root, Shape::Zcode)),
+        );
+    }
     roots
 }
 
@@ -231,6 +239,15 @@ fn classify(root: &Root, path: &Path) -> Match {
                 Match::Ignore
             };
         }
+        Shape::Zcode => {
+            // One store per db directory; `resolve` routes WAL and shared-memory
+            // sidecar hints to the database before classification.
+            return if parts.len() == 1 && name == "db.sqlite" {
+                Match::Database(path.to_path_buf())
+            } else {
+                Match::Ignore
+            };
+        }
         Shape::Antigravity => {
             let in_profile = parts.first().is_some_and(|part| {
                 *part == "antigravity-cli"
@@ -296,6 +313,16 @@ fn resolve(
                     .map(|name| path.with_file_name(name))
                     .filter(|database| sources::bob::is_configured_database(database))
                     .unwrap_or(path),
+                Shape::Zcode => path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| {
+                        name.strip_suffix("-wal")
+                            .or_else(|| name.strip_suffix("-shm"))
+                    })
+                    .filter(|name| *name == "db.sqlite")
+                    .map(|name| path.with_file_name(name))
+                    .unwrap_or(path),
                 _ => path,
             };
             if excluder.is_excluded(&path) {
@@ -353,6 +380,8 @@ fn resolve(
                     }
                     let source = if sources::bob::is_configured_database(&path) {
                         SourceKind::Bob
+                    } else if matches!(root.shape, Shape::Zcode) {
+                        SourceKind::Zcode
                     } else {
                         SourceKind::Opencode
                     };
@@ -468,6 +497,7 @@ mod tests {
             include_muse: false,
             include_antigravity: false,
             include_bob: false,
+            include_zcode: false,
             exclude_patterns: Vec::new(),
             embeddings: false,
             backfill_embeddings: false,

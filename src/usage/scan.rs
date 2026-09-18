@@ -132,6 +132,10 @@ pub(crate) fn source_spec(filter: SourceFilter) -> SourceSpec {
             parser_version: crate::sources::antigravity::VERSIONS.usage,
             volatile_reuse_ms: no_volatile_reuse,
         },
+        SourceFilter::Zcode => SourceSpec {
+            parser_version: crate::sources::zcode::VERSIONS.usage,
+            volatile_reuse_ms: no_volatile_reuse,
+        },
     }
 }
 
@@ -171,6 +175,7 @@ pub(crate) fn source_files(filter: SourceFilter) -> Vec<PathBuf> {
         SourceFilter::Muse => crate::sources::muse::usage_files(),
         SourceFilter::Antigravity => crate::sources::antigravity::usage_files(),
         SourceFilter::Bob => crate::sources::bob::usage_files(),
+        SourceFilter::Zcode => crate::sources::zcode::usage_files(),
     }
 }
 
@@ -487,6 +492,7 @@ pub(crate) fn parse_source_file(
         }
         SourceFilter::Hermes => crate::sources::hermes::parse_usage_file(path),
         SourceFilter::Bob => crate::sources::bob::parse_usage_file(path).map(FileParse::cacheable),
+        SourceFilter::Zcode => crate::sources::zcode::parse_usage_file(path),
         SourceFilter::Jcode => {
             crate::sources::jcode::parse_usage_file(path).map(FileParse::cacheable)
         }
@@ -816,12 +822,35 @@ fn scan_bob(
     Ok(())
 }
 
+fn scan_zcode(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
+    let files = source_files(SourceFilter::Zcode);
+    scan_files_cached(
+        SourceScan {
+            source: "zcode",
+            parser_version: crate::sources::zcode::VERSIONS.usage,
+            volatile_reuse_ms: no_volatile_reuse,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        // WAL-aware like Hermes: the parse result carries the -wal fingerprint
+        // and is only cached when the WAL did not move during the read.
+        crate::sources::zcode::parse_usage_file,
+    );
+    Ok(())
+}
+
 pub(crate) type SourceScanner =
     fn(&mut Vec<UsageEvent>, &mut Vec<String>, Option<&mut UsageCache>) -> Result<()>;
 
 /// Scanner ordinals double as merge tiebreaks: partitions are laid out and merged in
 /// this order, reproducing the combined assembly's stable sort exactly.
-pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 14] = [
+pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 15] = [
     (SourceFilter::Claude, scan_claude),
     (SourceFilter::Codex, scan_codex),
     (SourceFilter::Opencode, scan_opencode),
@@ -836,6 +865,7 @@ pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 14] = [
     (SourceFilter::Muse, scan_muse),
     (SourceFilter::Antigravity, scan_antigravity),
     (SourceFilter::Bob, scan_bob),
+    (SourceFilter::Zcode, scan_zcode),
 ];
 
 /// Scan and reconcile one source partition. Shared by combined assembly and

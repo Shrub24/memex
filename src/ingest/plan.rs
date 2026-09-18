@@ -59,11 +59,11 @@ pub(super) fn classify_file(
         return FileChange::Unchanged;
     }
     // A jcode session is one JSON object, an antigravity store is rewritten wholesale
-    // as the conversation grows, and a Bob task is a database query, so a byte offset
-    // cannot resume mid-file for any of them.
+    // as the conversation grows, and Bob/ZCode virtual paths are database queries,
+    // so none can resume from a byte offset.
     if matches!(
         source,
-        SourceKind::Jcode | SourceKind::Antigravity | SourceKind::Bob
+        SourceKind::Jcode | SourceKind::Antigravity | SourceKind::Bob | SourceKind::Zcode
     ) {
         FileChange::Replaced
     } else {

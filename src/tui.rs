@@ -419,6 +419,7 @@ enum SourceChoice {
     Muse,
     Antigravity,
     Bob,
+    Zcode,
 }
 
 impl SourceChoice {
@@ -438,7 +439,8 @@ impl SourceChoice {
             SourceChoice::Jcode => SourceChoice::Muse,
             SourceChoice::Muse => SourceChoice::Antigravity,
             SourceChoice::Antigravity => SourceChoice::Bob,
-            SourceChoice::Bob => SourceChoice::All,
+            SourceChoice::Bob => SourceChoice::Zcode,
+            SourceChoice::Zcode => SourceChoice::All,
         }
     }
 
@@ -459,6 +461,7 @@ impl SourceChoice {
             SourceChoice::Muse => Some(SourceFilter::Muse),
             SourceChoice::Antigravity => Some(SourceFilter::Antigravity),
             SourceChoice::Bob => Some(SourceFilter::Bob),
+            SourceChoice::Zcode => Some(SourceFilter::Zcode),
         }
     }
 
@@ -479,6 +482,7 @@ impl SourceChoice {
             SourceChoice::Muse => "muse",
             SourceChoice::Antigravity => "antigravity",
             SourceChoice::Bob => "bob",
+            SourceChoice::Zcode => "zcode",
         }
     }
 
@@ -498,6 +502,7 @@ impl SourceChoice {
             SourceKind::Muse => SourceChoice::Muse,
             SourceKind::Antigravity => SourceChoice::Antigravity,
             SourceKind::Bob => SourceChoice::Bob,
+            SourceKind::Zcode => SourceChoice::Zcode,
         }
     }
 }
@@ -1170,6 +1175,7 @@ impl App {
                     include_muse: true,
                     include_antigravity: true,
                     include_bob: true,
+                    include_zcode: true,
                     exclude_patterns: config.exclude_path_patterns(),
                     embeddings: embeddings_default,
                     backfill_embeddings: false,
@@ -2683,6 +2689,7 @@ impl App {
             SourceKind::Muse => "muse",
             SourceKind::Antigravity => "antigravity",
             SourceKind::Bob => "bob",
+            SourceKind::Zcode => "zcode",
         };
         let source_path = session.source_path.clone();
 
@@ -4141,6 +4148,7 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Muse => label == "muse",
         SourceChoice::Antigravity => label == "antigravity",
         SourceChoice::Bob => label == "bob",
+        SourceChoice::Zcode => label == "zcode",
         SourceChoice::All => false,
     }
 }
@@ -4161,6 +4169,7 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Muse => Color::Rgb(180, 130, 240),
         SourceKind::Antigravity => Color::Rgb(120, 200, 140),
         SourceKind::Bob => Color::Rgb(100, 150, 255),
+        SourceKind::Zcode => Color::Rgb(96, 222, 228),
     }
 }
 

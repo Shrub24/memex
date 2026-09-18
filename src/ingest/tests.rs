@@ -52,6 +52,7 @@ fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         include_muse: false,
         include_antigravity: false,
         include_bob: false,
+        include_zcode: false,
         embeddings,
         backfill_embeddings: false,
         model,
@@ -2525,6 +2526,7 @@ fn truncation_and_replacement_clear_stale_pending_calls() {
 fn device_renumbering_preserves_append_continuity() {
     let previous = FileIdentity {
         bob_database: None,
+        zcode_database: None,
         sqlite_wal: None,
         device: Some(1),
         inode: Some(2),
@@ -2546,6 +2548,7 @@ fn device_renumbering_preserves_append_continuity() {
 fn device_renumbering_does_not_hide_file_replacement() {
     let previous = FileIdentity {
         bob_database: None,
+        zcode_database: None,
         sqlite_wal: None,
         device: Some(1),
         inode: Some(2),
@@ -2834,6 +2837,7 @@ fn ingest_claude_records_preserve_sidechain_and_tool_links() {
         include_muse: false,
         include_antigravity: false,
         include_bob: false,
+        include_zcode: false,
         embeddings: false,
         backfill_embeddings: false,
         model: ModelChoice::default(),
@@ -3466,6 +3470,7 @@ fn ingest_pi_session_records_supported_message_shapes() {
         include_muse: false,
         include_antigravity: false,
         include_bob: false,
+        include_zcode: false,
         embeddings: false,
         backfill_embeddings: false,
         model: ModelChoice::default(),
@@ -5989,4 +5994,189 @@ fn bob_database_and_task_exclusions_apply_on_fresh_index_and_refresh() {
                 .is_empty()
         );
     }
+}
+
+#[test]
+fn zcode_refresh_preserves_other_session_ids_and_embeddings() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("zcode");
+    let database = root.join("cli/db/db.sqlite");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let _env = EnvVarGuard::set_os(&[("ZCODE_HOME", Some(root.as_os_str()))]);
+    crate::sources::zcode::tests::fixture_db(&database);
+    let writer = rusqlite::Connection::open(&database).unwrap();
+    writer
+        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
+    let mut options = ingest_options(true, ModelChoice::Potion);
+    options.include_zcode = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let full = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    let first = full();
+    assert_eq!(first.records_embedded, 3);
+    let child_records = || {
+        SearchIndex::open_or_create(&paths.index)
+            .unwrap()
+            .records_by_session_id("sess_subagent_child")
+            .unwrap()
+    };
+    let child_id = child_records()[0].doc_id;
+    let mut embedder = crate::embed::EmbedderHandle::with_model_and_runtime(
+        ModelChoice::Potion,
+        &options.embed_runtime,
+    )
+    .unwrap();
+    let query = embedder
+        .embed_texts(&["subagent prompt"])
+        .unwrap()
+        .remove(0);
+    let child_distance = || {
+        VectorIndex::open(&paths.vectors)
+            .unwrap()
+            .search(&query, 20)
+            .unwrap()
+            .into_iter()
+            .find(|(id, _)| *id == child_id)
+            .unwrap()
+            .1
+    };
+    let original_distance = child_distance();
+    assert_eq!(full().records_added, 0);
+
+    let before = database.metadata().unwrap();
+    writer
+        .execute(
+            "UPDATE part SET data = ?1 WHERE id = 'p_a'",
+            [r#"{"type":"text","text":"changed main response"}"#],
+        )
+        .unwrap();
+    assert_eq!(before.len(), database.metadata().unwrap().len());
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let dirty = ingest_dirty(
+        &paths,
+        &index,
+        &options,
+        &lease,
+        &HashSet::from([database.with_file_name("db.sqlite-wal")]),
+    )
+    .unwrap();
+    assert!(!dirty.full_scan);
+    assert_eq!(dirty.report.records_embedded, 2);
+    assert_eq!(child_records()[0].doc_id, child_id);
+    assert_eq!(child_distance(), original_distance);
+    drop(index);
+
+    writer
+        .execute("UPDATE model_usage SET input_tokens = input_tokens + 1", [])
+        .unwrap();
+    let usage_only = full();
+    assert_eq!(usage_only.records_added, 0);
+    assert_eq!(usage_only.records_embedded, 0);
+    assert_eq!(child_records()[0].doc_id, child_id);
+    assert_eq!(child_distance(), original_distance);
+
+    // Deleted rows and sessions are reconciled without relying on timestamps.
+    writer
+        .execute("DELETE FROM part WHERE id = 'p_a'", [])
+        .unwrap();
+    full();
+    assert!(!indexed_texts(&paths).contains(&"changed main response".to_string()));
+    writer
+        .execute("DELETE FROM session WHERE id = 'sess_subagent_child'", [])
+        .unwrap();
+    full();
+    assert!(child_records().is_empty());
+    assert!(
+        !VectorIndex::open(&paths.vectors)
+            .unwrap()
+            .contains(child_id)
+    );
+
+    // An unreadable database must not purge its existing sessions.
+    let before = indexed_texts(&paths);
+    writer
+        .execute_batch("ALTER TABLE session RENAME TO unavailable_session")
+        .unwrap();
+    full();
+    assert_eq!(indexed_texts(&paths), before);
+    writer
+        .execute_batch("ALTER TABLE unavailable_session RENAME TO session")
+        .unwrap();
+    drop(writer);
+    fs::remove_file(&database).unwrap();
+    full();
+    assert!(indexed_texts(&paths).is_empty());
+}
+
+#[test]
+fn zcode_migrates_database_checkpoint_and_honors_session_exclusions() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("zcode");
+    let database = root.join("cli/db/db.sqlite");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let _env = EnvVarGuard::set_os(&[("ZCODE_HOME", Some(root.as_os_str()))]);
+    crate::sources::zcode::tests::fixture_db(&database);
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut legacy = record(900, "user", "legacy database-wide copy");
+    legacy.source = SourceKind::Zcode;
+    legacy.source_path = database.to_string_lossy().into_owned();
+    legacy.session_id = "sess_main".into();
+    drop(save_search_records(&paths, &[legacy]));
+    IngestState {
+        next_doc_id: 901,
+        files: HashMap::from([(
+            database.to_string_lossy().into_owned(),
+            FileState {
+                size: 0,
+                mtime: 0,
+                offset: 0,
+                turn_id: 0,
+                legacy_turn_id: None,
+                parser_version: 1,
+                pending_tool_calls: HashMap::new(),
+                identity: FileIdentity::default(),
+                claude_background: None,
+                codex_metadata_offsets: None,
+            },
+        )]),
+        ..IngestState::default()
+    }
+    .save_with_lease(&paths.state.join("ingest.json"), &lease)
+    .unwrap();
+    let mut options = ingest_options(false, ModelChoice::Potion);
+    options.include_zcode = true;
+    let run = |options: &IngestOptions| {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, options, &lease).unwrap()
+    };
+    run(&options);
+    assert!(!indexed_texts(&paths).contains(&"legacy database-wide copy".to_string()));
+    let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+    assert_eq!(state.files.len(), 2);
+    assert!(!state.files.contains_key(database.to_str().unwrap()));
+    let reader =
+        crate::state::checkpoint::CheckpointReader::open(&paths.state.join("ingest.json")).unwrap();
+    assert_eq!(
+        reader.zcode_database_paths().unwrap(),
+        HashSet::from([database.to_string_lossy().into_owned()])
+    );
+    options.exclude_patterns = vec![
+        crate::sources::zcode::virtual_path(&database, "sess_main")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    run(&options);
+    assert_eq!(indexed_texts(&paths), ["subagent prompt"]);
+    options.exclude_patterns = vec![database.to_string_lossy().into_owned()];
+    run(&options);
+    assert!(indexed_texts(&paths).is_empty());
 }

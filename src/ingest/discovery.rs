@@ -313,6 +313,15 @@ fn journal_hints(
                         .filter(|database| database.is_file()),
                 );
             }
+            // The zcode store is in the same position: WAL-only commits leave no
+            // checkpoint to sweep from until the first full index sees it.
+            if options.include_zcode {
+                paths.extend(
+                    crate::sources::zcode::db_paths()
+                        .into_iter()
+                        .filter(|database| database.is_file()),
+                );
+            }
             crate::profiling::count!("journal.hints", paths.len());
             Some(paths)
         }
@@ -412,6 +421,7 @@ pub(super) fn file_identity(
 
     FileIdentity {
         bob_database: None,
+        zcode_database: None,
         sqlite_wal: None,
         #[cfg(unix)]
         device: Some(metadata.dev()),
@@ -458,7 +468,9 @@ pub(super) fn prepare_file_task(
         .filter(|previous| unchanged_file_metadata(previous, metadata, parser_version))
         .map(|previous| previous.identity.clone())
         .unwrap_or_else(|| file_identity(&path, metadata, prefix_bytes));
-    if source == SourceKind::Antigravity && crate::sources::antigravity::is_db_path(&path) {
+    if (source == SourceKind::Antigravity && crate::sources::antigravity::is_db_path(&path))
+        || source == SourceKind::Zcode
+    {
         identity.sqlite_wal = Some(crate::state::SqliteWalIdentity::read(&path));
     }
     let mut change = plan::classify_file(source, size, mtime, &identity, parser_version, previous);
@@ -600,16 +612,16 @@ pub(super) struct OpenCodeDiscovery {
 }
 
 #[derive(Default)]
-pub(super) struct BobDiscovery {
+pub(super) struct SessionDatabaseDiscovery {
     pub tasks: Vec<FileTask>,
     pub unchanged_identities: Vec<(String, FileIdentity)>,
     pub files_scanned: usize,
     pub files_skipped: usize,
     pub total_bytes: u64,
-    /// Virtual paths whose task vanished from a readable database, or whose database
+    /// Virtual paths whose session vanished from a readable database, or whose database
     /// was itself deleted.
     pub missing_paths: Vec<String>,
-    /// Databases that exist but could not be read this refresh. Their tasks must not be
+    /// Databases that exist but could not be read this refresh. Their sessions must not be
     /// deleted on any path (pending recovery included) because no replacement is coming.
     pub unreadable_databases: Vec<PathBuf>,
     pub diagnostics: crate::sources::ParseDiagnostics,
@@ -627,8 +639,8 @@ pub(super) fn discover_bob(
     excluder: &PathExcluder,
     state: &mut CheckpointSession,
     selected: Option<&[crate::sources::SourceFile]>,
-) -> Result<BobDiscovery> {
-    let mut result = BobDiscovery::default();
+) -> Result<SessionDatabaseDiscovery> {
+    let mut result = SessionDatabaseDiscovery::default();
     if !options.include_bob {
         return Ok(result);
     }
@@ -780,6 +792,127 @@ pub(super) fn discover_bob(
             let vanished =
                 absent.contains(&owner) || (readable.contains(&owner) && !current.contains(&key));
             if vanished {
+                state.delete_file(&key);
+                result.missing_paths.push(key);
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// ZCode sessions own independent checkpoints. Hash conversation rows rather than
+/// the database/WAL so accounting-only commits never schedule transcript replay.
+pub(super) fn discover_zcode(
+    options: &IngestOptions,
+    excluder: &PathExcluder,
+    state: &mut CheckpointSession,
+    selected: Option<&[crate::sources::SourceFile]>,
+) -> Result<SessionDatabaseDiscovery> {
+    let mut result = SessionDatabaseDiscovery::default();
+    if !options.include_zcode {
+        return Ok(result);
+    }
+    let databases = match selected {
+        Some(files) => files.iter().map(|file| file.path.clone()).collect(),
+        None => crate::sources::zcode::roots()
+            .into_iter()
+            .map(|root| root.join("cli/db/db.sqlite"))
+            .collect::<Vec<_>>(),
+    };
+    let parser_version =
+        crate::sources::index_state_version_for(SourceKind::Zcode, options.include_reasoning);
+    for database in databases {
+        let alias = database.canonicalize().ok();
+        let excluded = excluder.is_excluded(&database)
+            || alias
+                .as_ref()
+                .is_some_and(|path| excluder.is_excluded(path));
+        let absent = database.metadata().is_err_and(|error| {
+            error.kind() == std::io::ErrorKind::NotFound
+                && database.parent().is_some_and(Path::is_dir)
+        });
+        let sessions = if excluded || absent {
+            Vec::new()
+        } else {
+            match crate::sources::zcode::enumerate_sessions(&database) {
+                Ok(sessions) => sessions,
+                Err(_) => {
+                    result
+                        .diagnostics
+                        .unreadable_sources
+                        .push(database.to_string_lossy().into_owned());
+                    result.unreadable_databases.push(database);
+                    result.files_skipped += 1;
+                    continue;
+                }
+            }
+        };
+        let mut current = HashSet::new();
+        let keys = sessions
+            .iter()
+            .map(|session| {
+                crate::sources::zcode::virtual_path(&database, &session.id)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        state.preload(&keys, FileLoadScope::Targeted)?;
+        for (session, key) in sessions.into_iter().zip(keys) {
+            let path = PathBuf::from(&key);
+            if excluder.is_excluded(&path)
+                || alias.as_ref().is_some_and(|alias| {
+                    excluder.is_excluded(&crate::sources::zcode::virtual_path(alias, &session.id))
+                })
+            {
+                result.files_skipped += 1;
+                continue;
+            }
+            current.insert(key.clone());
+            result.files_scanned += 1;
+            result.total_bytes += session.size;
+            let identity = FileIdentity {
+                zcode_database: Some(database.to_string_lossy().into_owned()),
+                prefix_sha256: Some(session.fingerprint),
+                prefix_bytes: 1,
+                ..FileIdentity::default()
+            };
+            let change = plan::classify_file(
+                SourceKind::Zcode,
+                session.size,
+                0,
+                &identity,
+                parser_version,
+                state.file(&key),
+            );
+            if change == FileChange::Unchanged {
+                result.files_skipped += 1;
+                result.unchanged_identities.push((key, identity));
+                continue;
+            }
+            result.tasks.push(FileTask {
+                path,
+                source: SourceKind::Zcode,
+                offset: 0,
+                turn_id: 0,
+                legacy_turn_id: None,
+                size: session.size,
+                mtime: 0,
+                change,
+                pending_tool_calls: HashMap::new(),
+                identity,
+                parser_version,
+                codex_metadata_offsets: None,
+                claude_background: None,
+            });
+        }
+        // Reconcile only after a successful inventory (or confirmed removal).
+        // The raw database key is the pre-session-scoped checkpoint; replace it once.
+        let database_key = database.to_string_lossy().into_owned();
+        for key in state.file_keys()? {
+            let owned = key == database_key
+                || crate::sources::zcode::split_virtual_path(Path::new(&key))
+                    .is_some_and(|(owner, _)| owner == database);
+            if owned && !current.contains(&key) {
                 state.delete_file(&key);
                 result.missing_paths.push(key);
             }
@@ -1341,10 +1474,11 @@ pub(super) fn prepare_refresh(
                 state.persisted_file_keys()?,
             )
         };
-        // Bob virtual paths sit "under" a database file, never under a walked directory.
-        let known = known
-            .into_iter()
-            .filter(|key| !crate::sources::bob::matches_path(key));
+        // Bob and ZCode virtual paths sit "under" a database file, never under a walked directory.
+        let known = known.into_iter().filter(|key| {
+            !crate::sources::bob::matches_path(key)
+                && crate::sources::zcode::split_virtual_path(Path::new(key)).is_none()
+        });
         Some((
             directories::StampedWalk::new(previous, known.map(PathBuf::from)),
             fingerprint,
@@ -1389,19 +1523,21 @@ pub(super) fn prepare_refresh(
         state.delete_file(path);
     }
 
-    // A narrowed refresh splits its database hints by owner: Bob commits only re-diff
-    // Bob tasks, and OpenCode never sees a Bob database.
-    let (bob_selected, opencode_selected) = match selected.as_ref() {
+    // Route narrowed refreshes to the owning database adapter.
+    let (bob_selected, zcode_selected, opencode_selected) = match selected.as_ref() {
         Some((_, databases)) => {
             let (bob, opencode): (Vec<_>, Vec<_>) = databases
                 .iter()
                 .cloned()
                 .partition(|file| file.source == SourceKind::Bob);
-            (Some(bob), Some(opencode))
+            let (zcode, opencode): (Vec<_>, Vec<_>) = opencode
+                .into_iter()
+                .partition(|file| file.source == SourceKind::Zcode);
+            (Some(bob), Some(zcode), Some(opencode))
         }
-        None => (None, None),
+        None => (None, None, None),
     };
-    let discovery::BobDiscovery {
+    let discovery::SessionDatabaseDiscovery {
         tasks: mut bob_tasks,
         unchanged_identities: bob_unchanged_identities,
         files_scanned: bob_files_scanned,
@@ -1443,6 +1579,35 @@ pub(super) fn prepare_refresh(
     files_skipped += bob_files_skipped;
     total_bytes += bob_total_bytes;
 
+    let mut zcode = discover_zcode(options, &excluder, &mut state, zcode_selected.as_deref())?;
+    if let Some(pending) = &pending_recovery {
+        for path in &pending.source_paths {
+            let database = crate::sources::zcode::split_virtual_path(Path::new(path))
+                .map(|(database, _)| database)
+                .unwrap_or_else(|| PathBuf::from(path));
+            if zcode.unreadable_databases.contains(&database) {
+                anyhow::bail!(
+                    "ZCode source {path} has an interrupted replay but its database cannot be read"
+                );
+            }
+        }
+        for task in &mut zcode.tasks {
+            let database = crate::sources::zcode::split_virtual_path(&task.path)
+                .unwrap()
+                .0;
+            if pending.source_paths.iter().any(|path| {
+                *path == task.path.to_string_lossy() || *path == database.to_string_lossy()
+            }) {
+                task.change = FileChange::Replaced;
+            }
+        }
+    }
+    tasks.extend(zcode.tasks);
+    unchanged_identities.extend(zcode.unchanged_identities);
+    files_scanned += zcode.files_scanned;
+    files_skipped += zcode.files_skipped;
+    total_bytes += zcode.total_bytes;
+
     let Some(opencode) = discovery::discover_opencode(
         paths,
         index,
@@ -1477,6 +1642,7 @@ pub(super) fn prepare_refresh(
     let opencode_ready_owned_sessions = opencode.ready_owned_sessions;
     let mut opencode_diagnostics = opencode.diagnostics;
     opencode_diagnostics.merge(bob_diagnostics);
+    opencode_diagnostics.merge(zcode.diagnostics);
     let opencode_scope_targets = opencode.scope_targets;
     let opencode_session_cwds = opencode.session_cwds;
     let opencode_database_states = opencode.database_states;
@@ -1505,6 +1671,7 @@ pub(super) fn prepare_refresh(
         }
     }
     missing_state_paths.extend(bob_missing_paths);
+    missing_state_paths.extend(zcode.missing_paths);
 
     // Previously indexed records under now-excluded paths must be deleted even
     // when there is no ingest state entry for them (e.g. state loss or legacy runs).

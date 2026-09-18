@@ -2883,6 +2883,7 @@ fn local_ingest_options(config: &UserConfig) -> Result<IngestOptions> {
         include_muse: true,
         include_antigravity: true,
         include_bob: true,
+        include_zcode: true,
         exclude_patterns: config.exclude_path_patterns(),
         embeddings: config.embeddings_default(),
         backfill_embeddings: false,

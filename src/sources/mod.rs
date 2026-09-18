@@ -21,6 +21,7 @@ pub mod omp;
 pub mod openclaw;
 pub mod opencode;
 pub mod pi;
+pub mod zcode;
 
 use crate::state::PendingToolCall;
 use crate::types::SourceKind;
@@ -291,6 +292,7 @@ pub fn versions(source: SourceKind) -> ParserVersions {
         SourceKind::Muse => muse::VERSIONS,
         SourceKind::Antigravity => antigravity::VERSIONS,
         SourceKind::Bob => bob::VERSIONS,
+        SourceKind::Zcode => zcode::VERSIONS,
     }
 }
 
@@ -313,6 +315,7 @@ pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u
                 | SourceKind::Muse
                 | SourceKind::Grok
                 | SourceKind::Antigravity
+                | SourceKind::Zcode
         );
     (versions.identity.saturating_mul(10_000) + versions.index)
         .saturating_mul(2)
@@ -324,6 +327,8 @@ pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u
 pub fn classify_path(path: &str) -> SourceKind {
     if bob::matches_path(path) {
         SourceKind::Bob
+    } else if zcode::matches_path(path) {
+        SourceKind::Zcode
     } else if let Some(source) = codex::classify_path(path) {
         source
     } else if opencode::matches_path(path) {

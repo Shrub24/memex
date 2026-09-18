@@ -178,6 +178,12 @@ struct IndexArgs {
     /// Skip indexing IBM Bob tasks
     #[arg(long = "no-bob", default_value_t = false, hide = true)]
     no_bob: bool,
+    /// Index ZCode sessions from ~/.zcode/cli/db/db.sqlite [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    zcode: bool,
+    /// Skip indexing ZCode sessions
+    #[arg(long = "no-zcode", default_value_t = false, hide = true)]
+    no_zcode: bool,
     /// Generate embeddings for semantic search during indexing
     #[arg(long, help_heading = "Embeddings")]
     embeddings: bool,
@@ -2306,6 +2312,7 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         include_muse: index.source_enabled(IndexSource::Muse),
         include_antigravity: index.source_enabled(IndexSource::Antigravity),
         include_bob: index.source_enabled(IndexSource::Bob),
+        include_zcode: index.source_enabled(IndexSource::Zcode),
         exclude_patterns: excludes,
         embeddings,
         backfill_embeddings: false,
@@ -2642,7 +2649,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     let memory_embedded = embed_memory(&paths, model_choice, &embed_runtime)?;
     progress.finish();
     println!(
-        "embedded {} conversation vectors and {} memory section vectors (claude {}, codex {}, opencode {}, cursor {}, pi {}, openclaw {}, copilot {}, jcode {}, muse {}, grok {}, bob {})",
+        "embedded {} conversation vectors and {} memory section vectors (claude {}, codex {}, opencode {}, cursor {}, pi {}, openclaw {}, copilot {}, jcode {}, muse {}, grok {}, bob {}, zcode {})",
         embedded_total,
         memory_embedded,
         embedded_counts[crate::types::SourceKind::Claude.idx()],
@@ -2656,6 +2663,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
         embedded_counts[crate::types::SourceKind::Muse.idx()],
         embedded_counts[crate::types::SourceKind::Grok.idx()],
         embedded_counts[crate::types::SourceKind::Bob.idx()],
+        embedded_counts[crate::types::SourceKind::Zcode.idx()],
     );
 
     std::io::stdout().flush().ok();
@@ -5827,11 +5835,17 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Muse => "muse",
         crate::types::SourceKind::Antigravity => "antigravity",
         crate::types::SourceKind::Bob => "bob",
+        crate::types::SourceKind::Zcode => "zcode",
     };
     let source_path = &record.source_path;
     if record.source == crate::types::SourceKind::Bob {
         return Err(anyhow!(
             "sharing is not supported for Bob tasks: {source_path} is a database entry, not a transcript file"
+        ));
+    }
+    if record.source == crate::types::SourceKind::Zcode {
+        return Err(anyhow!(
+            "sharing is not supported for ZCode sessions: {source_path} is a database, not a transcript file"
         ));
     }
 
@@ -7161,6 +7175,9 @@ fn build_index_command_args(
     }
     if !index.bob || index.no_bob {
         args.push("--no-bob".to_string());
+    }
+    if !index.zcode || index.no_zcode {
+        args.push("--no-zcode".to_string());
     }
     if let Some(listen) = mcp_listen {
         args.push("--mcp".to_string());
@@ -8590,6 +8607,8 @@ mod tests {
             no_muse: false,
             no_antigravity: false,
             no_bob: false,
+            zcode: false,
+            no_zcode: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -8652,6 +8671,8 @@ mod tests {
             no_muse: false,
             no_antigravity: false,
             no_bob: false,
+            zcode: false,
+            no_zcode: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -8707,6 +8728,8 @@ mod tests {
             no_muse: false,
             no_antigravity: false,
             no_bob: false,
+            zcode: false,
+            no_zcode: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -8764,6 +8787,8 @@ mod tests {
             no_muse: false,
             no_antigravity: false,
             no_bob: false,
+            zcode: false,
+            no_zcode: false,
             embeddings: false,
             no_embeddings: false,
             model: None,

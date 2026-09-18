@@ -368,6 +368,33 @@ impl CheckpointReader {
         }
     }
 
+    /// Read indexed ZCode ownership entries. Legacy inventory is collected during the
+    /// existing `sqlite_backed_paths` pass, without adding another history traversal.
+    pub(crate) fn zcode_database_paths(&self) -> Result<HashSet<String>> {
+        match &self.backend {
+            Backend::Legacy(_) => Ok(HashSet::new()),
+            Backend::Sqlite { connection, .. } => {
+                // Older checkpoints acquire the index on the next writer open. Configured
+                // roots seed the watcher until discovery backfills ownership metadata.
+                let indexed: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='files_zcode_database')",
+                    [], |row| row.get(0),
+                )?;
+                if !indexed {
+                    return Ok(HashSet::new());
+                }
+                let mut statement = connection.prepare(
+                    "SELECT DISTINCT json_extract(payload, '$.identity.zcode_database')
+                     FROM files INDEXED BY files_zcode_database
+                     WHERE json_extract(payload, '$.identity.zcode_database') IS NOT NULL",
+                )?;
+                Ok(statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?)
+            }
+        }
+    }
+
     pub(crate) fn has_files_excluding(&self, excluded: &HashSet<String>) -> Result<bool> {
         crate::profiling::count!("state.checkpoint.key_scans", 1);
         match &self.backend {
@@ -422,10 +449,14 @@ impl CheckpointReader {
                         if file.identity.sqlite_wal.is_some() {
                             Some(path)
                         } else {
-                            file.identity.bob_database.or_else(|| {
-                                crate::sources::bob::split_virtual_path(Path::new(&path))
-                                    .map(|(database, _)| database.to_string_lossy().into_owned())
-                            })
+                            file.identity
+                                .zcode_database
+                                .or(file.identity.bob_database)
+                                .or_else(|| {
+                                    crate::sources::bob::split_virtual_path(Path::new(&path)).map(
+                                        |(database, _)| database.to_string_lossy().into_owned(),
+                                    )
+                                })
                         }
                     })
                     .collect())
