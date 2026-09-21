@@ -55,6 +55,7 @@
 
           PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [pkgs.openssl];
+          ORT_DYLIB_PATH = "${pkgs.onnxruntime}/lib/libonnxruntime${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
         };
       }
     )
