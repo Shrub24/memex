@@ -224,6 +224,7 @@ memex search "your query" --format text
 | Exact terms | `search "exact term"` |
 | Fuzzy concepts | `search "concept" --mode semantic` |
 | Mixed | `search "term concept" --mode hybrid` |
+| Relevance refinement | `search "query" --rerank` |
 
 Lexical matching stems English words, so `migration` also finds `migrations` and `migrated`.
 Indexes built before stemming keep matching whole words until `memex index rebuild`; memory
@@ -247,6 +248,9 @@ envelope. Its identifiers remain searchable through the `event_id` field.
 - `--fields score,ts,doc_id,record_id,session_id,snippet`
 - `--full` (all legacy search fields; conflicts with `--fields`)
 - `--mode lexical|semantic|hybrid`
+- `--rerank` (rescore the top results with a cross-encoder model; downloads on first use)
+- `--rerank-limit <n>` (how many top records to rerank, default 50, max 200; requires `--rerank`)
+- `--rerank-model bge|bge-m3|jina|jina-multilingual` (requires `--rerank`)
 - `--format jsonl|json|text|toon`
 - `--pretty` (pretty-print JSON output)
 
