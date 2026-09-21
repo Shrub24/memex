@@ -225,6 +225,7 @@ memex search "your query" --format text
 | Fuzzy concepts | `search "concept" --mode semantic` |
 | Mixed | `search "term concept" --mode hybrid` |
 | Relevance refinement | `search "query" --rerank` |
+| Type-ahead | `search "retr*"` |
 
 Lexical matching stems English words, so `migration` also finds `migrations` and `migrated`.
 Indexes built before stemming keep matching whole words until `memex index rebuild`; memory
@@ -232,6 +233,11 @@ search stems immediately. The same rebuild stops indexing the `tool_input` and `
 fields, which are stored for display only; their content is already searchable through `text`.
 The one exception is a Codex turn-lifecycle record, whose stored payload is the raw event
 envelope. Its identifiers remain searchable through the `event_id` field.
+
+A trailing `word*` matches any indexed word starting with `word`: `retr*` finds `retry` and
+`retracted`, and earlier words in the query must still match, so `retry back*` finds `retry
+backoff`. Indexes built before prefix matching keep the legacy wildcard behavior (the term
+must be complete) until `memex index rebuild`.
 ## Common filters
 
 - `--project <name>`

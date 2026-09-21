@@ -31,6 +31,9 @@ use tantivy::schema::{
     TextFieldIndexing, TextOptions,
 };
 use tantivy::store::StoreReader;
+use tantivy::tokenizer::{
+    LowerCaser, SimpleTokenStream, SimpleTokenizer, TextAnalyzer, Token, TokenStream, Tokenizer,
+};
 use tantivy::{
     DocId, Index, IndexReader, IndexWriter, Order, ReloadPolicy, Score, SegmentReader,
     TantivyDocument, Term,
@@ -45,6 +48,10 @@ pub struct IndexFields {
     /// Present in indexes created after canonical record lookup was introduced. Older indexes
     /// remain readable and use a scoped stored-record fallback until they are rebuilt.
     pub canonical_record_id: Option<Field>,
+    /// Present in indexes created after edge-n-gram prefix search was introduced. Older
+    /// indexes remain readable; `word*` queries fall back to legacy wildcard parsing until
+    /// they are rebuilt.
+    pub text_prefix: Option<Field>,
     pub doc_id: Field,
     pub ts: Field,
     pub project: Field,
@@ -677,12 +684,15 @@ impl SearchIndex {
                 && existing.schema().get_field("reader_metadata").is_ok()
             {
                 check_term_dictionary_format(&existing, &load_fields(existing.schema())?, dir)?;
+                register_word_prefix_tokenizer(&existing);
                 existing
             } else {
                 return Err(stale_schema_error(dir));
             }
         } else {
-            Index::create(directory, build_schema()?, Default::default())?
+            let index = Index::create(directory, build_schema()?, Default::default())?;
+            register_word_prefix_tokenizer(&index);
+            index
         };
         Ok(Self {
             fields: load_fields(index.schema())?,
@@ -706,6 +716,7 @@ impl SearchIndex {
             if !schema_is_current(&index.schema()) {
                 return Err(stale_schema_error(dir));
             }
+            register_word_prefix_tokenizer(&index);
             let fields = load_fields(index.schema())?;
             Ok(Self {
                 index,
@@ -962,7 +973,10 @@ impl SearchIndex {
         doc.add_field_value(self.fields.project, record.project);
         doc.add_field_value(self.fields.session_id, record.session_id);
         doc.add_field_value(self.fields.role, record.role);
-        doc.add_field_value(self.fields.text, record.text);
+        doc.add_field_value(self.fields.text, record.text.clone());
+        if let Some(field) = self.fields.text_prefix {
+            doc.add_field_value(field, record.text);
+        }
         if let Some(tool_name) = record.tool_name {
             doc.add_field_value(self.fields.tool_name, tool_name);
         }
@@ -2108,6 +2122,7 @@ fn check_term_dictionary_format(index: &Index, fields: &IndexFields, dir: &Path)
 fn create_index_in_dir(dir: &Path) -> Result<SearchIndex> {
     let schema = build_schema()?;
     let index = Index::create_in_dir(dir, schema.clone())?;
+    register_word_prefix_tokenizer(&index);
     let fields = load_fields(schema)?;
     Ok(SearchIndex {
         index,
@@ -2140,6 +2155,7 @@ fn open_sealed_generation(dir: &Path) -> Result<SearchIndex> {
     if !schema_is_current(&index.schema()) {
         return Err(stale_schema_error(dir));
     }
+    register_word_prefix_tokenizer(&index);
     let fields = load_fields(index.schema())?;
     check_term_dictionary_format(&index, &fields, dir)?;
     Ok(SearchIndex {
@@ -2510,6 +2526,97 @@ fn sync_directory(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Emits every word's leading-edge n-grams (lengths 2 through 12, lowercased), so a
+/// single-term query on the field matches any indexed word starting with that term:
+/// "retry" yields re, ret, retr, ..., and `retr*` finds it. Words shorter than two
+/// characters index whole (tantivy's n-gram floor would otherwise drop them).
+/// Whole-value `NgramTokenizer::prefix_only` is not usable here: it only n-grams
+/// position 0 of the entire field text, so it would capture prefixes of the first
+/// word alone.
+#[derive(Clone, Default)]
+struct WordPrefixTokenizer {
+    inner: SimpleTokenizer,
+}
+
+const WORD_PREFIX_MIN: usize = 2;
+const WORD_PREFIX_MAX: usize = 12;
+
+impl Tokenizer for WordPrefixTokenizer {
+    type TokenStream<'a> = WordPrefixTokenStream<'a>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+        WordPrefixTokenStream {
+            words: self.inner.token_stream(text),
+            word: String::new(),
+            pending: None,
+            token: Token::default(),
+        }
+    }
+}
+
+struct WordPrefixTokenStream<'a> {
+    words: SimpleTokenStream<'a>,
+    word: String,
+    /// Length in chars of the next prefix to emit; None once the word is done.
+    pending: Option<usize>,
+    token: Token,
+}
+
+impl TokenStream for WordPrefixTokenStream<'_> {
+    fn advance(&mut self) -> bool {
+        loop {
+            if let Some(length) = self.pending {
+                let char_len = self.word.chars().count();
+                let end = self
+                    .word
+                    .char_indices()
+                    .nth(length)
+                    .map_or(self.word.len(), |(byte, _)| byte);
+                self.token.position = 0;
+                self.token.offset_from = 0;
+                self.token.offset_to = end;
+                self.token.text.clear();
+                self.token.text.push_str(&self.word[..end]);
+                self.pending = if length < char_len && length < WORD_PREFIX_MAX {
+                    Some(length + 1)
+                } else {
+                    None
+                };
+                return true;
+            }
+            let Some(next) = self.words.next() else {
+                return false;
+            };
+            let word: String = next.text.chars().collect();
+            self.word = if word.chars().count() > WORD_PREFIX_MAX {
+                word.chars().take(WORD_PREFIX_MAX).collect()
+            } else {
+                word
+            };
+            self.pending = Some(WORD_PREFIX_MIN);
+        }
+    }
+
+    fn token(&self) -> &Token {
+        &self.token
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        &mut self.token
+    }
+}
+
+/// Registers `word_prefix` on an index's tokenizer manager. Needed on every open:
+/// tantivy's default manager knows only its built-in tokenizers.
+fn register_word_prefix_tokenizer(index: &Index) {
+    index.tokenizers().register(
+        "word_prefix",
+        TextAnalyzer::builder(WordPrefixTokenizer::default())
+            .filter(LowerCaser)
+            .build(),
+    );
+}
+
 fn build_schema() -> Result<Schema> {
     build_schema_with_canonical_record_id(true)
 }
@@ -2552,6 +2659,19 @@ fn build_schema_with_options(
         .set_indexing_options(text_indexing)
         .set_stored();
     builder.add_text_field("text", text_options);
+
+    // `text_prefix` mirrors `text` tokenized into per-word edge n-grams, so a term
+    // query matches any word starting with that term — `retr*` finds "retry". Words
+    // shorter than the minimum gram still index whole, so 2-char prefixes are the
+    // floor. Not stored; only consulted by explicit `word*` queries.
+    builder.add_text_field(
+        "text_prefix",
+        TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("word_prefix")
+                .set_index_option(IndexRecordOption::Basic),
+        ),
+    );
 
     builder.add_text_field("tool_name", STRING | STORED);
     // Queries only parse against `text`, which already carries a tool result's content;
@@ -2611,6 +2731,7 @@ fn load_fields(schema: Schema) -> Result<IndexFields> {
     Ok(IndexFields {
         reader_metadata: schema.get_field("reader_metadata").ok(),
         canonical_record_id: schema.get_field("canonical_record_id").ok(),
+        text_prefix: schema.get_field("text_prefix").ok(),
         doc_id: get("doc_id")?,
         ts: get("ts")?,
         project: get("project")?,
@@ -2635,6 +2756,40 @@ fn load_fields(schema: Schema) -> Result<IndexFields> {
     })
 }
 
+/// Rewrites a trailing `word*` against the edge-n-gram field when the index has one.
+/// A term query on `text_prefix` is a prefix match by construction: the tokenizer emits
+/// only each word's leading n-grams, so the term exists iff some indexed word starts
+/// with it. Multi-word queries keep every earlier word parsed normally against `text`
+/// and must the prefix clause. Returns None whenever the index predates the field, the
+/// query has no trailing `*`, or the final word is quoted/fuzzy — anything that must
+/// keep the parser's legacy semantics.
+fn prefix_query_for(fields: &IndexFields, index: &Index, query: &str) -> Option<Box<dyn Query>> {
+    let prefix_field = fields.text_prefix?;
+    let body = query.strip_suffix('*')?;
+    if body.is_empty() || body.contains('*') {
+        return None;
+    }
+    let (head, last_word) = match body.rsplit_once(' ') {
+        Some((head, word)) => (Some(head), word),
+        None => (None, body),
+    };
+    if last_word.contains('"') || last_word.contains('^') || last_word.is_empty() {
+        return None;
+    }
+    let prefix_term = Term::from_field_text(prefix_field, &last_word.to_lowercase());
+    let prefix_query =
+        Box::new(TermQuery::new(prefix_term, IndexRecordOption::Basic)) as Box<dyn Query>;
+    let Some(head) = head else {
+        return Some(prefix_query);
+    };
+    let parser = tantivy::query::QueryParser::for_index(index, vec![fields.text]);
+    let head_query = parser.parse_query(head).ok()?;
+    Some(Box::new(BooleanQuery::new(vec![
+        (Occur::Must, head_query),
+        (Occur::Must, prefix_query),
+    ])))
+}
+
 fn build_query(
     fields: &IndexFields,
     options: &QueryOptions,
@@ -2644,6 +2799,8 @@ fn build_query(
 
     if options.query.trim().is_empty() {
         clauses.push((Occur::Must, Box::new(AllQuery)));
+    } else if let Some(prefix_query) = prefix_query_for(fields, index, options.query.trim()) {
+        clauses.push((Occur::Must, prefix_query));
     } else {
         let parser = tantivy::query::QueryParser::for_index(index, vec![fields.text]);
         let text_query = parser.parse_query(&options.query)?;
@@ -3976,6 +4133,76 @@ mod tests {
         let new_reader = SearchIndex::open_or_create(tmp.path()).expect("new reader");
         assert_eq!(search_text_count(&new_reader, "beforeupdate"), 0);
         assert_eq!(search_text_count(&new_reader, "afterupdate"), 1);
+    }
+
+    #[test]
+    fn trailing_wildcard_prefix_matches_word_starts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut writer = index.writer().expect("writer");
+        index
+            .add_record(
+                &mut writer,
+                &test_record(1, "the retry backoff is configured"),
+            )
+            .expect("add record");
+        index
+            .add_record(&mut writer, &test_record(2, "backup the database"))
+            .expect("add record");
+        writer.commit().expect("commit");
+
+        assert_eq!(search_text_count(&index, "retr*"), 1);
+        assert_eq!(search_text_count(&index, "back*"), 2);
+        assert_eq!(search_text_count(&index, "retry*"), 1);
+        // No trailing wildcard: unchanged legacy semantics.
+        assert_eq!(search_text_count(&index, "retr"), 0);
+        assert_eq!(search_text_count(&index, "rollback*"), 0);
+    }
+
+    #[test]
+    fn trailing_wildcard_head_and_prefix_clauses_combine() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut writer = index.writer().expect("writer");
+        index
+            .add_record(
+                &mut writer,
+                &test_record(1, "retry backoff configured today"),
+            )
+            .expect("add record");
+        index
+            .add_record(&mut writer, &test_record(2, "retry interval elapsed"))
+            .expect("add record");
+        index
+            .add_record(&mut writer, &test_record(3, "config backup completed"))
+            .expect("add record");
+        writer.commit().expect("commit");
+
+        assert_eq!(search_text_count(&index, "retry back*"), 1);
+        assert_eq!(search_text_count(&index, "retry config*"), 1);
+    }
+
+    #[test]
+    fn legacy_schema_without_prefix_field_keeps_wildcard_semantics() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("index");
+        fs::create_dir(&dir).expect("index directory");
+        let mut schema =
+            serde_json::to_value(build_schema().expect("schema")).expect("serialize schema");
+        let fields = schema.as_array_mut().expect("schema fields");
+        fields.retain(|field| field["name"] != "text_prefix");
+        let schema: Schema = serde_json::from_value(schema).expect("legacy schema");
+        drop(Index::create_in_dir(&dir, schema).expect("create legacy index"));
+
+        let index = SearchIndex::open_or_create(&dir).expect("open legacy index");
+        let mut writer = index.writer().expect("writer");
+        index
+            .add_record(&mut writer, &test_record(1, "the retry backoff"))
+            .expect("add record");
+        writer.commit().expect("commit");
+
+        assert_eq!(search_text_count(&index, "retr*"), 0);
+        assert_eq!(search_text_count(&index, "retry*"), 1);
     }
 
     #[test]
