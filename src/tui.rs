@@ -5881,6 +5881,7 @@ fn run_search_request(
             },
             &crate::search::Selection::conversations(RESULT_LIMIT, request.kind),
             false,
+            None,
         )?;
         let matchers = crate::cli::build_matchers(&request.query)?;
         let sessions = result

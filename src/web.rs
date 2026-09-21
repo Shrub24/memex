@@ -1551,6 +1551,7 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
             },
             &crate::search::Selection::conversations(target, params.origin),
             false,
+            None,
         )?;
         let has_more = found.items.len() > params.offset.saturating_add(params.limit);
         let matchers = crate::cli::build_matchers(&params.query)?;

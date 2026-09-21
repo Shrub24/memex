@@ -479,6 +479,20 @@ OUTPUT FIELDS (--fields):
         /// Persist a metadata-only retrieval trace and print its ID to stderr
         #[arg(long, help_heading = "Tuning")]
         trace: bool,
+        /// Rescore the top results with a cross-encoder model (downloads on first use)
+        #[arg(long, help_heading = "Tuning")]
+        rerank: bool,
+        /// How many top records to rerank (default 50, max 200; requires --rerank)
+        #[arg(long, value_name = "N", help_heading = "Tuning", requires = "rerank")]
+        rerank_limit: Option<usize>,
+        /// Cross-encoder model: bge (default), bge-m3, jina, jina-multilingual (requires --rerank)
+        #[arg(
+            long,
+            value_name = "MODEL",
+            help_heading = "Tuning",
+            requires = "rerank"
+        )]
+        rerank_model: Option<String>,
     },
     /// Interactive terminal UI for browsing sessions
     Tui {
@@ -1465,6 +1479,9 @@ pub fn run() -> Result<()> {
             root,
             machine,
             trace,
+            rerank,
+            rerank_limit,
+            rerank_model,
         } => {
             run_search(
                 query,
@@ -1497,6 +1514,9 @@ pub fn run() -> Result<()> {
                 root,
                 machine,
                 trace,
+                rerank,
+                rerank_limit,
+                rerank_model,
             )?;
         }
         Commands::Tui {
@@ -3038,6 +3058,9 @@ fn run_search(
     root: Option<PathBuf>,
     machines: Vec<String>,
     trace: bool,
+    rerank: bool,
+    rerank_limit: Option<usize>,
+    rerank_model: Option<String>,
 ) -> Result<()> {
     crate::profiling::span!("cli.search");
     let format = if json_array && !verbose {
@@ -3057,6 +3080,7 @@ fn run_search(
     } else {
         SearchMode::Lexical
     };
+    crate::rerank::validate_rerank_content(rerank, content)?;
     if content != SearchContent::Conversations {
         return run_search_with_memories(MemorySurfaceSearchArgs {
             query,
@@ -3109,6 +3133,10 @@ fn run_search(
         fields: search_fields(fields, full)?,
         sort,
         verbose,
+        rerank: rerank.then(|| crate::rerank::RerankOptions {
+            limit: rerank_limit.unwrap_or(crate::rerank::DEFAULT_RERANK_LIMIT),
+            model: rerank_model,
+        }),
         format: if json_array && !verbose {
             SearchFormat::Json
         } else {
@@ -3303,6 +3331,7 @@ fn collect_search_with_memories(
             fields: fields.clone(),
             sort,
             verbose: false,
+            rerank: None,
             format: SearchFormat::Json,
             root: root.clone(),
             machines: machines.clone(),
@@ -3505,6 +3534,7 @@ struct SearchCollectRequest {
     fields: Option<HashSet<String>>,
     sort: SortBy,
     verbose: bool,
+    rerank: Option<crate::rerank::RerankOptions>,
     format: SearchFormat,
     root: Option<PathBuf>,
     machines: Vec<String>,
@@ -3670,6 +3700,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
                     )?,
                     sort: SortBy::Score,
                     verbose: false,
+                    rerank: None,
                     format: SearchFormat::Json,
                     root: Some(paths.root.clone()),
                     machines: vec![machine],
@@ -3792,6 +3823,7 @@ fn collect_search_with_auto_index(
         fields,
         sort,
         verbose,
+        rerank: rerank_options,
         format,
         root,
         machines,
@@ -3811,7 +3843,7 @@ fn collect_search_with_auto_index(
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
     let options = QueryOptions {
-        query,
+        query: query.clone(),
         project,
         role,
         tool,
@@ -3843,6 +3875,14 @@ fn collect_search_with_auto_index(
         matchers,
         format,
         fields,
+    };
+    let mut rerank_pass = match rerank_options.as_ref() {
+        Some(options) => Some(crate::rerank::RerankPass::for_search(
+            options,
+            &config,
+            &paths.root.join("embed-cache"),
+        )?),
+        None => None,
     };
 
     let selected_machines = crate::machine::selected_machine_ids(&config, &machines)?;
@@ -3881,6 +3921,7 @@ fn collect_search_with_auto_index(
             kind_filter,
         },
         auto_index_local,
+        rerank_pass.as_mut(),
     )?;
     let results = collected.items;
     let query_candidate_counts = collected.query_candidate_counts;
@@ -3916,6 +3957,7 @@ struct RenderOptions {
     matchers: Vec<regex::Regex>,
     format: SearchFormat,
     fields: Option<HashSet<String>>,
+
 }
 
 #[derive(Serialize)]
@@ -4189,6 +4231,7 @@ pub(crate) fn mcp_search(root: Option<PathBuf>, request: SearchRequest) -> Resul
         fields: search_fields(None, false)?,
         sort: request.sort.into(),
         verbose: false,
+        rerank: None,
         format: SearchFormat::Json,
         root,
         machines: request.machines,
@@ -10136,6 +10179,41 @@ arguments = {
             panic!("expected usage command");
         };
         assert_eq!(machine, ["mini"]);
+    }
+
+    #[test]
+    fn search_rerank_flags_parse_and_require_rerank() {
+        let cli = Cli::try_parse_from([
+            "memex",
+            "search",
+            "needle",
+            "--rerank",
+            "--rerank-limit",
+            "25",
+            "--rerank-model",
+            "jina",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Search {
+                rerank,
+                rerank_limit,
+                rerank_model,
+                ..
+            }) => {
+                assert!(rerank);
+                assert_eq!(rerank_limit, Some(25));
+                assert_eq!(rerank_model.as_deref(), Some("jina"));
+            }
+            _ => panic!("expected search command"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["memex", "search", "needle", "--rerank-limit", "25"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["memex", "search", "needle", "--rerank-model", "jina"]).is_err()
+        );
     }
 
     #[test]

@@ -61,6 +61,7 @@ pub(crate) fn collect(
     spec: &SearchSpec,
     selection: &Selection,
     auto_index_local: bool,
+    mut rerank: Option<&mut crate::rerank::RerankPass>,
 ) -> Result<SearchResults> {
     let mut candidate_limit = selection.limit.saturating_mul(5).max(100);
     let mut failures = Vec::new();
@@ -102,6 +103,10 @@ pub(crate) fn collect(
             &fused,
             selection.kind_filter != SessionKindFilter::All,
         );
+        let mut fused = fused;
+        if let (Some(pass), Some(query)) = (rerank.as_deref_mut(), queries.first()) {
+            pass.apply(query, &mut fused)?;
+        }
         let items = select_results(fused, selection, &kinds);
         if items.len() >= selection.limit || !capped || candidate_limit == usize::MAX {
             return Ok(SearchResults {
