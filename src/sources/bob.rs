@@ -841,6 +841,8 @@ impl UsageCollector<'_> {
                 output,
                 reasoning,
             },
+            credits: None,
+            token_usage_available: true,
             source_cost_usd: cost,
             // Bob prices its own requests; without a recorded cost nothing is authoritative.
             cost_authoritative: cost.is_some(),

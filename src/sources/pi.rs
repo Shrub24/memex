@@ -840,6 +840,8 @@ pub(crate) fn parse_usage_file_for(
                     .or_else(|| current_model.clone())
                     .filter(|model| !excluded_models.contains(&model.as_str())),
                 tokens,
+                credits: None,
+                token_usage_available: true,
                 source_cost_usd: usage
                     .get("cost")
                     .and_then(|value| value.get("total"))

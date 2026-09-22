@@ -433,6 +433,8 @@ function HomeActivityChart({
               ? "Activity unavailable"
               : loading || !currentPayload
                 ? "Loading activity…"
+                : metric === "tokens" && source === "kiro"
+                  ? "Token usage unavailable · Kiro reports credits"
                 : `${compactNumber.format(chart.total)} ${metric}${currentPayload.partial ? " · partial" : ""}`}
           </span>
           {chart.groups.length > 0 && (
@@ -1066,6 +1068,7 @@ function App() {
                   <SelectItem value="pi">Pi</SelectItem>
                   <SelectItem value="openclaw">OpenClaw</SelectItem>
                   <SelectItem value="copilot">Copilot</SelectItem>
+                  <SelectItem value="kiro">Kiro</SelectItem>
                 </SelectGroup>
               </SelectContent>
             </Select>
@@ -1394,6 +1397,7 @@ function App() {
                           <SelectItem value="pi">Pi</SelectItem>
                           <SelectItem value="openclaw">OpenClaw</SelectItem>
                           <SelectItem value="copilot">Copilot</SelectItem>
+                          <SelectItem value="kiro">Kiro</SelectItem>
                         </SelectGroup>
                       </SelectContent>
                     </Select>

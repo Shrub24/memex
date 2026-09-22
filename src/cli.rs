@@ -175,6 +175,12 @@ struct IndexArgs {
     /// Skip indexing Antigravity conversations
     #[arg(long = "no-antigravity", default_value_t = false, hide = true)]
     no_antigravity: bool,
+    /// Index Kiro CLI sessions from ~/.kiro/sessions [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    kiro: bool,
+    /// Skip indexing Kiro CLI sessions
+    #[arg(long = "no-kiro", default_value_t = false, hide = true)]
+    no_kiro: bool,
     /// Index IBM Bob tasks from ~/.bob/db/bob.db [default: true]
     #[arg(long, default_value_t = true, hide = true)]
     bob: bool,
@@ -330,7 +336,7 @@ OUTPUT FIELDS (--fields):
         /// Filter by session ID
         #[arg(long, help_heading = "Filters")]
         session: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, or muse
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, or kiro
         #[arg(long, help_heading = "Filters")]
         source: Option<SourceFilter>,
         /// Filter by origin: regular (default), interactive, subagent, or all (includes permission reviews)
@@ -674,7 +680,7 @@ EXAMPLES:
         /// Filter by project (repository grouping)
         #[arg(long)]
         project: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, or muse
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, or kiro
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Only include sessions active on or after this date/timestamp
@@ -919,7 +925,7 @@ enum HerdrCommand {
         /// Refuse when no resumable session exists in --cwd instead of using another project
         #[arg(long)]
         strict_cwd: bool,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, or muse
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, or kiro
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Path to memex data directory [default: ~/.memex]
@@ -2636,6 +2642,7 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         include_antigravity: index.source_enabled(IndexSource::Antigravity),
         include_bob: index.source_enabled(IndexSource::Bob),
         include_zcode: index.source_enabled(IndexSource::Zcode),
+        include_kiro: index.source_enabled(IndexSource::Kiro),
         exclude_patterns: excludes,
         embeddings,
         backfill_embeddings: false,
@@ -5164,7 +5171,7 @@ fn print_usage_rows(
     cache_waste: &crate::usage::CacheWaste,
     by_source: &[crate::usage::UsageSummary],
 ) {
-    const HEADERS: [&str; 10] = [
+    const HEADERS: [&str; 11] = [
         "source",
         "events",
         "input",
@@ -5173,6 +5180,7 @@ fn print_usage_rows(
         "output",
         "total",
         "cost",
+        "credits",
         "hit",
         "re-billed",
     ];
@@ -5191,23 +5199,37 @@ fn print_usage_rows(
         totals.cache_read += row.cache_read;
         totals.cache_write += row.cache_write;
         totals.output += row.output;
+        totals.unavailable_token_events += row.unavailable_token_events;
+        if let Some(credits) = row.credits {
+            *totals.credits.get_or_insert(0.0) += credits;
+        }
     }
-    let cells = |row: &crate::usage::UsageSummary| -> [String; 10] {
+    let cells = |row: &crate::usage::UsageSummary| -> [String; 11] {
         let prompt_tokens = row.uncached_input + row.cache_read + row.cache_write;
         let cache_active = row.cache_read > 0 || row.cache_write > 0;
+        let token_count = |value| {
+            if row.events > 0 && row.unavailable_token_events == row.events {
+                "unavailable".to_string()
+            } else {
+                format_count(value)
+            }
+        };
         [
             row.source.clone(),
             format_count(row.events),
-            format_count(row.uncached_input),
-            format_count(row.cache_read),
-            format_count(row.cache_write),
-            format_count(row.output),
-            format_count(row.total_tokens),
+            token_count(row.uncached_input),
+            token_count(row.cache_read),
+            token_count(row.cache_write),
+            token_count(row.output),
+            token_count(row.total_tokens),
             if row.priced_events > 0 {
                 format_usd(row.known_cost_usd)
             } else {
                 "-".to_string()
             },
+            row.credits
+                .map(|credits| format!("{credits:.6}"))
+                .unwrap_or_else(|| "-".into()),
             if cache_active && prompt_tokens > 0 {
                 format!(
                     "{:.1}%",
@@ -5225,10 +5247,10 @@ fn print_usage_rows(
             },
         ]
     };
-    let mut table: Vec<[String; 10]> = vec![HEADERS.map(str::to_string)];
+    let mut table: Vec<[String; 11]> = vec![HEADERS.map(str::to_string)];
     table.extend(by_source.iter().map(cells));
     table.push(cells(&totals));
-    let mut widths = [0usize; 10];
+    let mut widths = [0usize; 11];
     for row in &table {
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.len());
@@ -6079,6 +6101,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Antigravity => "antigravity",
         crate::types::SourceKind::Bob => "bob",
         crate::types::SourceKind::Zcode => "zcode",
+        crate::types::SourceKind::Kiro => "kiro",
     };
     let source_path = &record.source_path;
     if record.source == crate::types::SourceKind::Bob {
@@ -7412,6 +7435,9 @@ fn build_index_command_args(
     }
     if !index.jcode || index.no_jcode {
         args.push("--no-jcode".to_string());
+    }
+    if !index.kiro || index.no_kiro {
+        args.push("--no-kiro".to_string());
     }
     if !index.muse || index.no_muse {
         args.push("--no-muse".to_string());
@@ -8953,6 +8979,8 @@ mod tests {
             no_bob: false,
             zcode: false,
             no_zcode: false,
+            kiro: false,
+            no_kiro: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -9017,6 +9045,8 @@ mod tests {
             no_bob: false,
             zcode: false,
             no_zcode: false,
+            kiro: true,
+            no_kiro: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -9074,6 +9104,8 @@ mod tests {
             no_bob: false,
             zcode: false,
             no_zcode: false,
+            kiro: true,
+            no_kiro: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -9133,6 +9165,8 @@ mod tests {
             no_bob: false,
             zcode: false,
             no_zcode: false,
+            kiro: true,
+            no_kiro: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -9848,6 +9882,7 @@ arguments = {
             "--no-grok",
             "--no-jcode",
             "--no-muse",
+            "--no-kiro",
         ])
         .unwrap();
 

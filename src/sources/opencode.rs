@@ -1781,6 +1781,8 @@ fn usage_event(
         provider,
         model,
         tokens,
+        credits: None,
+        token_usage_available: true,
         source_cost_usd: value.get("cost").and_then(|value| value.as_f64()),
         cost_authoritative: false,
         dedupe_confidence: "exact",

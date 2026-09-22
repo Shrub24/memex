@@ -53,6 +53,7 @@ fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         include_antigravity: false,
         include_bob: false,
         include_zcode: false,
+        include_kiro: false,
         embeddings,
         backfill_embeddings: false,
         model,
@@ -2562,6 +2563,7 @@ fn truncation_and_replacement_clear_stale_pending_calls() {
 #[test]
 fn device_renumbering_preserves_append_continuity() {
     let previous = FileIdentity {
+        source_metadata_sha256: None,
         bob_database: None,
         zcode_database: None,
         sqlite_wal: None,
@@ -2584,6 +2586,7 @@ fn device_renumbering_preserves_append_continuity() {
 #[test]
 fn device_renumbering_does_not_hide_file_replacement() {
     let previous = FileIdentity {
+        source_metadata_sha256: None,
         bob_database: None,
         zcode_database: None,
         sqlite_wal: None,
@@ -2858,6 +2861,7 @@ fn ingest_claude_records_preserve_sidechain_and_tool_links() {
     paths.ensure_dirs().expect("ensure dirs");
     let index = SearchIndex::open_or_create(&paths.index).expect("index");
     let options = IngestOptions {
+        include_kiro: false,
         claude_sources: vec![claude_root],
         exclude_patterns: Vec::new(),
         include_agents: false,
@@ -3491,6 +3495,7 @@ fn ingest_pi_session_records_supported_message_shapes() {
     paths.ensure_dirs().expect("ensure dirs");
     let index = SearchIndex::open_or_create(&paths.index).expect("index");
     let options = IngestOptions {
+        include_kiro: false,
         claude_sources: vec![tmp.path().join("missing-claude")],
         exclude_patterns: Vec::new(),
         include_agents: false,

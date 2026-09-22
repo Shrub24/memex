@@ -2,6 +2,26 @@ import AppKit
 import Testing
 @testable import Memex
 
+@MainActor @Test func kiroAttachmentsUseExistingReaderAndPreserveRawContent() {
+    let source = #"[{"type":"image","image_url":"file:///tmp/photo.png"},{"type":"document","title":"Rules","content":"historical rules","source":{"type":"text","data":"historical rules"}},{"type":"document","file_url":"file:///tmp/report.pdf"}]"#
+    let message = Message(role: "user", text: "", toolName: nil, toolInput: nil,
+        toolOutput: nil, sourceContent: source)
+    #expect(SourceContent.blocks(message) == [
+        .attachment(label: "Image", source: "file:///tmp/photo.png", image: true),
+        .code("historical rules", language: "text"),
+        .attachment(label: "Attachment", source: "file:///tmp/report.pdf", image: false),
+    ])
+    let reader = TranscriptController()
+    reader.view.frame = NSRect(x: 0, y: 0, width: 700, height: 500)
+    let record = TranscriptRecord(recordID: "kiro-attachment", record: message)
+    reader.update(sessionID: "kiro", records: [record], provider: "kiro")
+    #expect(reader.measurement(at: 0).richContent != nil)
+    #expect(reader.measurement(at: 0).hasBody)
+    reader.update(sessionID: "kiro", records: [record], provider: "kiro", rawTranscript: true)
+    #expect(reader.measurement(at: 0).body.contains("historical rules"))
+    #expect(reader.measurement(at: 0).body.contains("source_content"))
+}
+
 @Test func onlyTypedRepresentedImagesSuppressStandalonePlaceholders() {
     let text = "<<ImageDisplayed>>\nWhat changed?\n<<ImageDisplayed>>"
     var message = Message(role: "user", text: text, toolName: nil, toolInput: nil, toolOutput: nil)

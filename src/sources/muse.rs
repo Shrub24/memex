@@ -624,6 +624,8 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
                 provider: current_provider.clone(),
                 model,
                 tokens,
+                credits: None,
+                token_usage_available: true,
                 source_cost_usd: None,
                 cost_authoritative: false,
                 dedupe_confidence: "exact",

@@ -157,6 +157,8 @@ pub(crate) struct FactRow {
     pub(crate) request_id: Option<String>,
     pub(crate) message_id: Option<String>,
     pub(crate) tokens: TokenBuckets,
+    pub(crate) credits: Option<f64>,
+    pub(crate) token_usage_available: bool,
     pub(crate) source_cost_usd: Option<f64>,
     pub(crate) cost_authoritative: bool,
     pub(crate) dedupe_confidence: &'static str,
@@ -176,7 +178,8 @@ fn fact_source_label(ordinal: i64) -> Option<&'static str> {
 const FACT_COLUMNS: &str =
     "ordinal, path, source_order, timestamp_ms, session_id, project, provider,
         model, source_record_id, request_id, message_id, raw_input, uncached_input,
-        cache_read, cache_write, cache_write_1h, output, reasoning, source_cost_usd,
+        cache_read, cache_write, cache_write_1h, output, reasoning, credits,
+        token_usage_available, source_cost_usd,
         cost_authoritative, dedupe_confidence, conservative_undercount,
         cache_chain_excluded, sidechain, permission_review";
 
@@ -227,17 +230,19 @@ pub(crate) fn read_fact_assembly(
                 output: as_u64(16)?,
                 reasoning: as_u64(17)?,
             },
-            source_cost_usd: row.get(18)?,
-            cost_authoritative: row.get::<_, i64>(19)? != 0,
-            dedupe_confidence: match text(20)? {
+            credits: row.get(18)?,
+            token_usage_available: row.get::<_, i64>(19)? != 0,
+            source_cost_usd: row.get(20)?,
+            cost_authoritative: row.get::<_, i64>(21)? != 0,
+            dedupe_confidence: match text(22)? {
                 "exact" => "exact",
                 "strong" => "strong",
                 _ => "heuristic",
             },
-            conservative_undercount: row.get::<_, i64>(21)? != 0,
-            cache_chain_excluded: row.get::<_, i64>(22)? != 0,
-            sidechain: row.get::<_, i64>(23)? != 0,
-            permission_review: row.get::<_, i64>(24)? != 0,
+            conservative_undercount: row.get::<_, i64>(23)? != 0,
+            cache_chain_excluded: row.get::<_, i64>(24)? != 0,
+            sidechain: row.get::<_, i64>(25)? != 0,
+            permission_review: row.get::<_, i64>(26)? != 0,
         });
     }
     let assembly = builder.finish();
@@ -250,7 +255,7 @@ pub(crate) fn read_fact_assembly(
 fn map_fact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, FactRow)> {
     let ordinal: i64 = row.get(0)?;
     let as_u64 = |index: usize| row.get::<_, i64>(index).map(|value| value as u64);
-    let dedupe: String = row.get(20)?;
+    let dedupe: String = row.get(22)?;
     Ok((
         ordinal,
         FactRow {
@@ -275,17 +280,19 @@ fn map_fact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, FactRow)> {
                 output: as_u64(16)?,
                 reasoning: as_u64(17)?,
             },
-            source_cost_usd: row.get(18)?,
-            cost_authoritative: row.get::<_, i64>(19)? != 0,
+            credits: row.get(18)?,
+            token_usage_available: row.get::<_, i64>(19)? != 0,
+            source_cost_usd: row.get(20)?,
+            cost_authoritative: row.get::<_, i64>(21)? != 0,
             dedupe_confidence: match dedupe.as_str() {
                 "exact" => "exact",
                 "strong" => "strong",
                 _ => "heuristic",
             },
-            conservative_undercount: row.get::<_, i64>(21)? != 0,
-            cache_chain_excluded: row.get::<_, i64>(22)? != 0,
-            sidechain: row.get::<_, i64>(23)? != 0,
-            permission_review: row.get::<_, i64>(24)? != 0,
+            conservative_undercount: row.get::<_, i64>(23)? != 0,
+            cache_chain_excluded: row.get::<_, i64>(24)? != 0,
+            sidechain: row.get::<_, i64>(25)? != 0,
+            permission_review: row.get::<_, i64>(26)? != 0,
         },
     ))
 }
@@ -469,6 +476,8 @@ impl FactRow {
             provider: self.provider.as_deref(),
             model: self.model.as_deref(),
             tokens: self.tokens.clone(),
+            credits: self.credits,
+            token_usage_available: self.token_usage_available,
             source_cost_usd: self.source_cost_usd,
             cost_authoritative: self.cost_authoritative,
             dedupe_confidence: self.dedupe_confidence,
@@ -493,6 +502,8 @@ impl FactRow {
             provider: self.provider,
             model: self.model,
             tokens: self.tokens,
+            credits: self.credits,
+            token_usage_available: self.token_usage_available,
             source_cost_usd: self.source_cost_usd,
             cost_authoritative: self.cost_authoritative,
             dedupe_confidence: self.dedupe_confidence,

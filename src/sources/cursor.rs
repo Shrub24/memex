@@ -560,6 +560,8 @@ fn extract_usage(
                             .and_then(|value| borrowed_string(value, &["modelName"]))
                     }),
                 tokens: TokenBuckets::disjoint(input, 0, 0, output),
+                credits: None,
+                token_usage_available: true,
                 source_cost_usd: None,
                 cost_authoritative: false,
                 dedupe_confidence: if table == "cursorDiskKV" {

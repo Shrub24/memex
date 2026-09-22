@@ -36,6 +36,7 @@ pub(super) fn classify_file(
         return FileChange::ParserChanged;
     }
     if size < previous.size
+        || previous.identity.source_metadata_sha256 != identity.source_metadata_sha256
         || previous.offset > size
         || mtime < previous.mtime
         || file_was_replaced(&previous.identity, identity)

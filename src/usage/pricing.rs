@@ -562,6 +562,8 @@ mod tests {
             provider: Some("anthropic".into()),
             model: Some("claude-sonnet-4-6".into()),
             tokens,
+            credits: None,
+            token_usage_available: true,
             source_cost_usd: None,
             cost_authoritative: false,
             dedupe_confidence: "exact",
@@ -589,6 +591,8 @@ mod tests {
             provider: Some("anthropic".into()),
             model: Some("claude-sonnet-4-6".into()),
             tokens: TokenBuckets::disjoint(100, 0, 0, 0),
+            credits: None,
+            token_usage_available: true,
             source_cost_usd: Some(0.0),
             cost_authoritative: false,
             dedupe_confidence: "exact",
@@ -612,6 +616,20 @@ pub(crate) fn accumulate_usage_event(
 ) {
     let total = event.tokens.additive_total();
     report.events += 1;
+    if !event.token_usage_available {
+        report.unavailable_token_events += 1;
+        report.credits = Some(report.credits.unwrap_or(0.0) + event.credits.unwrap_or(0.0));
+        let row = by_source
+            .entry(event.source)
+            .or_insert_with(|| UsageSummary {
+                source: event.source.to_string(),
+                ..UsageSummary::default()
+            });
+        row.events += 1;
+        row.unavailable_token_events += 1;
+        row.credits = Some(row.credits.unwrap_or(0.0) + event.credits.unwrap_or(0.0));
+        return;
+    }
     report.total_tokens = report.total_tokens.saturating_add(total);
     report.unknown_model_events += u64::from(event.model.is_none());
     report.conservative_events += u64::from(event.conservative_undercount);

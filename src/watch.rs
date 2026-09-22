@@ -157,6 +157,9 @@ pub(crate) fn watch_roots(options: &IngestOptions) -> Vec<PathBuf> {
     if options.include_jcode {
         roots.push(crate::sources::jcode::sessions_root());
     }
+    if options.include_kiro {
+        roots.push(crate::sources::kiro::sessions_root());
+    }
     if options.include_muse {
         roots.push(crate::sources::muse::sessions_root());
     }
@@ -813,6 +816,7 @@ mod tests {
             include_antigravity: true,
             include_bob: true,
             include_zcode: true,
+            include_kiro: true,
             exclude_patterns: Vec::new(),
             embeddings: false,
             backfill_embeddings: false,
@@ -874,6 +878,7 @@ mod tests {
             ("GROK_HOME", Some("/tmp/memex-watch-test-grok")),
             ("JCODE_HOME", Some("/tmp/memex-watch-test-jcode")),
             ("MUSE_HOME", Some("/tmp/memex-watch-test-muse")),
+            ("KIRO_SESSIONS_DIR", None),
             ("XDG_DATA_HOME", None),
         ]);
 
@@ -897,6 +902,7 @@ mod tests {
             "memex-watch-test-grok",
             "jcode/sessions",
             "muse/sessions",
+            ".kiro/sessions",
         ] {
             assert!(
                 rendered.iter().any(|root| root.contains(expected)),
@@ -927,6 +933,7 @@ mod tests {
         options.include_antigravity = false;
         options.include_bob = false;
         options.include_zcode = false;
+        options.include_kiro = false;
         let roots = watch_roots(&options);
         assert_eq!(roots, options.claude_sources);
     }
@@ -1389,6 +1396,7 @@ mod tests {
             pending_tool_calls: HashMap::new(),
             codex_metadata_offsets: None,
             identity: FileIdentity {
+                source_metadata_sha256: None,
                 bob_database: None,
                 zcode_database: None,
                 sqlite_wal: None,

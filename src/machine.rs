@@ -288,6 +288,10 @@ pub struct UsageReportWire {
     pub authority: String,
     pub events: u64,
     pub total_tokens: u64,
+    #[serde(default)]
+    pub credits: Option<f64>,
+    #[serde(default)]
+    pub unavailable_token_events: u64,
     pub unknown_model_events: u64,
     pub conservative_events: u64,
     pub cost_mode: CostMode,
@@ -2455,6 +2459,8 @@ fn usage_local(paths: &Paths, config: &UserConfig, spec: &UsageSpec) -> Result<U
         authority: report.authority.to_string(),
         events: report.events,
         total_tokens: report.total_tokens,
+        credits: report.credits,
+        unavailable_token_events: report.unavailable_token_events,
         unknown_model_events: report.unknown_model_events,
         conservative_events: report.conservative_events,
         cost_mode: report.cost_mode,
@@ -2589,6 +2595,8 @@ fn merge_usage_reports(
         authority: "multi-machine reconstructed usage (not subscription quota)".to_string(),
         events: 0,
         total_tokens: 0,
+        credits: None,
+        unavailable_token_events: 0,
         unknown_model_events: 0,
         conservative_events: 0,
         cost_mode,
@@ -2607,6 +2615,10 @@ fn merge_usage_reports(
     };
     for (machine, mut report) in reports {
         merged.events = merged.events.saturating_add(report.events);
+        merged.unavailable_token_events += report.unavailable_token_events;
+        if let Some(credits) = report.credits {
+            *merged.credits.get_or_insert(0.0) += credits;
+        }
         merged.total_tokens = merged.total_tokens.saturating_add(report.total_tokens);
         merged.unknown_model_events = merged
             .unknown_model_events
@@ -3083,6 +3095,7 @@ fn local_ingest_options(config: &UserConfig) -> Result<IngestOptions> {
         include_antigravity: true,
         include_bob: true,
         include_zcode: true,
+        include_kiro: true,
         exclude_patterns: config.exclude_path_patterns(),
         embeddings: config.embeddings_default(),
         backfill_embeddings: false,
@@ -4834,6 +4847,8 @@ mod tests {
             authority: "local".to_string(),
             events: 1,
             total_tokens: tokens,
+            credits: None,
+            unavailable_token_events: 0,
             unknown_model_events: 0,
             conservative_events: 0,
             cost_mode: CostMode::Auto,
@@ -4866,5 +4881,21 @@ mod tests {
         assert_eq!(merged.total_tokens, 30);
         assert_eq!(merged.by_source[0].source, "local/codex");
         assert_eq!(merged.by_source[1].source, "mini/claude");
+        let mut credit_report = report(0, "kiro");
+        credit_report.credits = Some(0.75);
+        credit_report.unavailable_token_events = 1;
+        credit_report.known_cost_usd = 0.0;
+        credit_report.priced_events = 0;
+        credit_report.by_source[0].credits = Some(0.75);
+        credit_report.by_source[0].unavailable_token_events = 1;
+        let merged = merge_usage_reports(
+            vec![("local".into(), credit_report)],
+            Vec::new(),
+            CostMode::Auto,
+        );
+        assert_eq!(merged.credits, Some(0.75));
+        assert_eq!(merged.unavailable_token_events, 1);
+        assert_eq!(merged.total_tokens, 0);
+        assert_eq!(merged.by_source[0].credits, Some(0.75));
     }
 }

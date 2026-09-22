@@ -19,6 +19,8 @@ fn fact_event(path: &str, record: &str) -> super::UsageEvent {
         provider: None,
         model: None,
         tokens: super::TokenBuckets::disjoint(10, 0, 0, 5),
+        credits: None,
+        token_usage_available: true,
         source_cost_usd: None,
         cost_authoritative: false,
         dedupe_confidence: "exact",

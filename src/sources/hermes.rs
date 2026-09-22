@@ -525,6 +525,8 @@ fn event(
         provider: text(row, "billing_provider"),
         model: text(row, "model"),
         tokens,
+        credits: None,
+        token_usage_available: true,
         source_cost_usd,
         cost_authoritative,
         dedupe_confidence: "strong",

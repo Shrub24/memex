@@ -1143,7 +1143,17 @@ impl AnalyticsWriter {
                 ..SessionMetadata::default()
             };
         };
-        let git = GitMetadata::from(self.repositories.resolve(Path::new(&cwd)));
+        let mut git = GitMetadata::from(self.repositories.resolve(Path::new(&cwd)));
+        if key.source == SourceKind::Kiro && git.repo_project.is_none() && !Path::new(&cwd).exists()
+        {
+            git.repo_project = Path::new(&cwd)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned);
+            if git.repo_project.is_some() {
+                git.status = "path-fallback".to_string();
+            }
+        }
         SessionMetadata {
             cwd: Some(cwd),
             git_root: git.git_root,
@@ -1437,6 +1447,9 @@ fn resolve_session_cwd_from_parts(
         && let Some(cwd) = crate::sources::jcode::cwd_from_jcode_session(Path::new(source_path))
     {
         return Some(cwd.to_string_lossy().to_string());
+    }
+    if source == SourceKind::Kiro {
+        return crate::sources::kiro::session_cwd(Path::new(source_path));
     }
     if source == SourceKind::Muse
         && let Some(cwd) = crate::sources::muse::cwd_from_muse_session(Path::new(source_path))
@@ -2847,6 +2860,80 @@ mod tests {
         assert!(
             plan.contains("sessions_repository_project_last_at_idx"),
             "{plan}"
+        );
+    }
+
+    #[test]
+    fn kiro_repository_grouping_uses_archived_workspace_but_prefers_local_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repository");
+        fs::create_dir_all(repo.join("nested")).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let standalone = tmp.path().join("standalone");
+        fs::create_dir(&standalone).unwrap();
+        let mut records = Vec::new();
+        for (id, cwd) in [
+            (
+                "archived",
+                Some(tmp.path().join("missing/archived-project")),
+            ),
+            ("local", Some(repo.join("nested"))),
+            ("non-git", Some(standalone)),
+            ("no-metadata", None),
+        ] {
+            let dir = tmp.path().join(id);
+            fs::create_dir_all(&dir).unwrap();
+            let transcript = dir.join("messages.jsonl");
+            if let Some(cwd) = cwd {
+                fs::write(
+                    dir.join("session.json"),
+                    serde_json::json!({"workspacePaths":[cwd]}).to_string(),
+                )
+                .unwrap();
+            }
+            let mut row = record("raw", id, &transcript, 10);
+            row.source = SourceKind::Kiro;
+            records.push(row);
+        }
+        let db = tmp.path().join("analytics.sqlite");
+        rebuild_from_records(&db, records).unwrap();
+        let store = AnalyticsStore::open(&db).unwrap();
+        let rows = store
+            .query_sessions(None, None, None, ProjectGrouping::Repository, None)
+            .unwrap();
+        for (id, expected) in [
+            ("archived", "archived-project"),
+            ("local", "repository"),
+            ("non-git", UNFILED_PROJECT),
+            ("no-metadata", UNFILED_PROJECT),
+        ] {
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.session_id == id)
+                    .unwrap()
+                    .display_project,
+                expected
+            );
+        }
+        assert_eq!(
+            store
+                .query_sessions(
+                    None,
+                    None,
+                    Some("archived-project"),
+                    ProjectGrouping::Repository,
+                    None
+                )
+                .unwrap()
+                .len(),
+            1
         );
     }
 

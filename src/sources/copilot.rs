@@ -724,6 +724,8 @@ fn extract_usage(
                     attribute_u64(attributes, "gen_ai.usage.reasoning.output_tokens")
                         .max(attribute_u64(attributes, "gen_ai.usage.reasoning_tokens")),
                 ),
+                credits: None,
+                token_usage_available: true,
                 source_cost_usd: None,
                 cost_authoritative: false,
                 dedupe_confidence: "exact",

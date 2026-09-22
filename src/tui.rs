@@ -419,6 +419,7 @@ enum SourceChoice {
     Antigravity,
     Bob,
     Zcode,
+    Kiro,
 }
 
 impl SourceChoice {
@@ -439,7 +440,8 @@ impl SourceChoice {
             SourceChoice::Muse => SourceChoice::Antigravity,
             SourceChoice::Antigravity => SourceChoice::Bob,
             SourceChoice::Bob => SourceChoice::Zcode,
-            SourceChoice::Zcode => SourceChoice::All,
+            SourceChoice::Zcode => SourceChoice::Kiro,
+            SourceChoice::Kiro => SourceChoice::All,
         }
     }
 
@@ -461,6 +463,7 @@ impl SourceChoice {
             SourceChoice::Antigravity => Some(SourceFilter::Antigravity),
             SourceChoice::Bob => Some(SourceFilter::Bob),
             SourceChoice::Zcode => Some(SourceFilter::Zcode),
+            SourceChoice::Kiro => Some(SourceFilter::Kiro),
         }
     }
 
@@ -482,6 +485,7 @@ impl SourceChoice {
             SourceChoice::Antigravity => "antigravity",
             SourceChoice::Bob => "bob",
             SourceChoice::Zcode => "zcode",
+            SourceChoice::Kiro => "kiro",
         }
     }
 
@@ -502,6 +506,7 @@ impl SourceChoice {
             SourceKind::Antigravity => SourceChoice::Antigravity,
             SourceKind::Bob => SourceChoice::Bob,
             SourceKind::Zcode => SourceChoice::Zcode,
+            SourceKind::Kiro => SourceChoice::Kiro,
         }
     }
 }
@@ -1169,6 +1174,7 @@ impl App {
                     include_antigravity: true,
                     include_bob: true,
                     include_zcode: true,
+                    include_kiro: true,
                     exclude_patterns: config.exclude_path_patterns(),
                     embeddings: embeddings_default,
                     backfill_embeddings: false,
@@ -2693,6 +2699,7 @@ impl App {
             SourceKind::Antigravity => "antigravity",
             SourceKind::Bob => "bob",
             SourceKind::Zcode => "zcode",
+            SourceKind::Kiro => "kiro",
         };
         let source_path = session.source_path.clone();
 
@@ -3454,6 +3461,9 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
                             ""
                         }
                     ),
+                    HomeChartMode::Tokens if app.source == SourceChoice::Kiro => {
+                        "Token usage unavailable · Kiro reports credits".into()
+                    }
                     HomeChartMode::Tokens => {
                         let total = activity_value_in_bounds(chart_activity, bounds);
                         format!(
@@ -4166,6 +4176,7 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Antigravity => label == "antigravity",
         SourceChoice::Bob => label == "bob",
         SourceChoice::Zcode => label == "zcode",
+        SourceChoice::Kiro => label == "kiro",
         SourceChoice::All => false,
     }
 }
@@ -4187,6 +4198,7 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Antigravity => Color::Rgb(120, 200, 140),
         SourceKind::Bob => Color::Rgb(100, 150, 255),
         SourceKind::Zcode => Color::Rgb(96, 222, 228),
+        SourceKind::Kiro => Color::Rgb(180, 130, 240),
     }
 }
 

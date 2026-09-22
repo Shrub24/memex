@@ -31,6 +31,8 @@ pub(crate) struct CachedUsageEvent {
     provider: Option<String>,
     model: Option<String>,
     tokens: TokenBuckets,
+    credits: Option<f64>,
+    token_usage_available: bool,
     source_cost_usd: Option<f64>,
     cost_authoritative: bool,
     dedupe_confidence: String,
@@ -54,6 +56,8 @@ struct CachedUsageEventRef<'a> {
     provider: Option<&'a str>,
     model: Option<&'a str>,
     tokens: &'a TokenBuckets,
+    credits: Option<f64>,
+    token_usage_available: bool,
     source_cost_usd: Option<f64>,
     cost_authoritative: bool,
     dedupe_confidence: &'a str,
@@ -76,6 +80,8 @@ impl<'a> CachedUsageEventRef<'a> {
             provider: event.provider.as_deref(),
             model: event.model.as_deref(),
             tokens: &event.tokens,
+            credits: event.credits,
+            token_usage_available: event.token_usage_available,
             source_cost_usd: event.source_cost_usd,
             cost_authoritative: event.cost_authoritative,
             dedupe_confidence: event.dedupe_confidence,
@@ -101,6 +107,8 @@ impl CachedUsageEvent {
             provider: event.provider.clone(),
             model: event.model.clone(),
             tokens: event.tokens.clone(),
+            credits: event.credits,
+            token_usage_available: event.token_usage_available,
             source_cost_usd: event.source_cost_usd,
             cost_authoritative: event.cost_authoritative,
             dedupe_confidence: event.dedupe_confidence.to_string(),
@@ -125,6 +133,8 @@ impl CachedUsageEvent {
             provider: self.provider,
             model: self.model,
             tokens: self.tokens,
+            credits: self.credits,
+            token_usage_available: self.token_usage_available,
             source_cost_usd: self.source_cost_usd,
             cost_authoritative: self.cost_authoritative,
             dedupe_confidence: match self.dedupe_confidence.as_str() {
@@ -214,9 +224,9 @@ impl UsageCache {
         // when its event layout changes so old rows cannot decode with shifted fields.
         let event_format: i64 =
             connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if event_format != 1 {
+        if event_format != 2 {
             connection
-                .execute_batch("DROP TABLE IF EXISTS usage_file_cache; PRAGMA user_version = 1;")?;
+                .execute_batch("DROP TABLE IF EXISTS usage_file_cache; PRAGMA user_version = 2;")?;
         }
         // Drop pre-postcard cache tables and any schema missing a required column: the
         // JSON-era claude table, the pre-rename blob column, and the deps_blob column that
@@ -280,6 +290,8 @@ impl UsageCache {
                   cache_write_1h INTEGER NOT NULL DEFAULT 0,
                   output INTEGER NOT NULL DEFAULT 0,
                   reasoning INTEGER NOT NULL DEFAULT 0,
+                  credits REAL,
+                  token_usage_available INTEGER NOT NULL DEFAULT 1,
                   source_cost_usd REAL,
                   cost_authoritative INTEGER NOT NULL DEFAULT 0,
                   dedupe_confidence TEXT NOT NULL DEFAULT '',
@@ -321,6 +333,8 @@ impl UsageCache {
         let schema_current = |connection: &Connection| -> rusqlite::Result<bool> {
             connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('usage_facts') WHERE name = 'row_idx')
+                    AND EXISTS(SELECT 1 FROM pragma_table_info('usage_facts') WHERE name = 'credits')
+                    AND EXISTS(SELECT 1 FROM pragma_table_info('usage_facts') WHERE name = 'token_usage_available')
                     AND EXISTS(SELECT 1 FROM pragma_table_info('usage_fact_sync') WHERE name = 'generation')",
                 [],
                 |row| row.get(0),
@@ -364,7 +378,7 @@ impl UsageCache {
                  DELETE FROM usage_fact_files WHERE source = OLD.source AND path = OLD.path;
              END;",
         )?;
-        if event_format != 1 || current_columns < 2 {
+        if event_format != 2 || current_columns < 2 {
             connection.execute("DELETE FROM usage_fact_sync", [])?;
         }
         // A blob update is not a facts update. Invalidate in the same SQLite
@@ -770,12 +784,12 @@ fn insert_fact_events<'a>(
              source, path, row_idx, source_order, ordinal, timestamp_ms, session_id,
              project, provider, model, source_record_id, request_id, message_id,
              raw_input, uncached_input, cache_read, cache_write, cache_write_1h,
-             output, reasoning, source_cost_usd, cost_authoritative,
+             output, reasoning, credits, token_usage_available, source_cost_usd, cost_authoritative,
              dedupe_confidence, conservative_undercount, cache_chain_excluded,
              sidechain, permission_review
          ) VALUES (
              ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-             ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
+             ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
          )",
     )?;
     // Per-file positions, in insertion order. Callers preserve the sorted
@@ -809,6 +823,8 @@ fn insert_fact_events<'a>(
             event.tokens.cache_write_1h as i64,
             event.tokens.output as i64,
             event.tokens.reasoning as i64,
+            event.credits,
+            i64::from(event.token_usage_available),
             event.source_cost_usd,
             i64::from(event.cost_authoritative),
             event.dedupe_confidence,
@@ -1029,7 +1045,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            1
+            2
         );
     }
 
@@ -1250,6 +1266,8 @@ mod tests {
             provider: None,
             model: None,
             tokens: TokenBuckets::disjoint(10, 0, 0, 5),
+            credits: None,
+            token_usage_available: true,
             source_cost_usd: None,
             cost_authoritative: false,
             dedupe_confidence: "exact",

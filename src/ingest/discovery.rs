@@ -72,6 +72,9 @@ pub(super) fn discover_transcripts(
     if options.include_antigravity && full_scan {
         files.extend(crate::sources::antigravity::discover());
     }
+    if options.include_kiro && full_scan {
+        files.extend(crate::sources::kiro::discover());
+    }
 
     // A watcher hint names the file that changed, not necessarily the projection
     // that owns its conversation. Resolve ownership here for both scan modes.
@@ -420,6 +423,7 @@ pub(super) fn file_identity(
     };
 
     FileIdentity {
+        source_metadata_sha256: None,
         bob_database: None,
         zcode_database: None,
         sqlite_wal: None,
@@ -472,6 +476,9 @@ pub(super) fn prepare_file_task(
         || source == SourceKind::Zcode
     {
         identity.sqlite_wal = Some(crate::state::SqliteWalIdentity::read(&path));
+    }
+    if source == SourceKind::Kiro {
+        identity.source_metadata_sha256 = Some(crate::sources::kiro::metadata_fingerprint(&path));
     }
     let mut change = plan::classify_file(source, size, mtime, &identity, parser_version, previous);
     let (mut offset, mut turn_id, mut pending_tool_calls) = match (change, previous) {

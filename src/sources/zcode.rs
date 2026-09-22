@@ -564,6 +564,8 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<UsageParseOutput> {
                 provider: row.provider_id.filter(|value| !value.is_empty()),
                 model: row.model_id.filter(|value| !value.is_empty()),
                 tokens,
+                credits: None,
+                token_usage_available: true,
                 // ZCode reports no per-request cost (subscription billing).
                 source_cost_usd: None,
                 cost_authoritative: false,

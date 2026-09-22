@@ -60,6 +60,8 @@ pub(crate) fn cache_event(
             output: 10,
             reasoning: 0,
         },
+        credits: None,
+        token_usage_available: true,
         source_cost_usd: None,
         cost_authoritative: false,
         dedupe_confidence: "exact",
@@ -174,6 +176,8 @@ pub struct UsageEventData<S, P> {
     pub provider: Option<S>,
     pub model: Option<S>,
     pub tokens: TokenBuckets,
+    pub credits: Option<f64>,
+    pub token_usage_available: bool,
     pub source_cost_usd: Option<f64>,
     /// A missing source cost is intentionally covered by an authoritative aggregate.
     #[serde(skip)]
@@ -201,6 +205,10 @@ pub struct UsageSummary {
     pub output: u64,
     pub reasoning: u64,
     pub total_tokens: u64,
+    #[serde(default)]
+    pub credits: Option<f64>,
+    #[serde(default)]
+    pub unavailable_token_events: u64,
     pub known_cost_usd: f64,
     pub priced_events: u64,
     pub unpriced_events: u64,
@@ -229,6 +237,8 @@ pub struct UsageReport {
     pub authority: &'static str,
     pub events: u64,
     pub total_tokens: u64,
+    pub credits: Option<f64>,
+    pub unavailable_token_events: u64,
     pub unknown_model_events: u64,
     pub conservative_events: u64,
     pub cost_mode: CostMode,

@@ -95,6 +95,13 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
             .collect(),
     );
     push(
+        SourceKind::Kiro,
+        super::kiro::discover()
+            .into_iter()
+            .map(|file| file.path)
+            .collect(),
+    );
+    push(
         SourceKind::Muse,
         super::muse::discover(None)
             .into_iter()
@@ -322,6 +329,11 @@ fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &
         // Jcode files are audited whole-document in `audit_jcode_file` and never
         // reach the per-line path.
         SourceKind::Jcode => {}
+        SourceKind::Kiro => {
+            if let Some(kind) = value.pointer("/payload/type").and_then(Value::as_str) {
+                increment(&mut audit.semantic_types, kind);
+            }
+        }
         SourceKind::Muse => {
             if let Some(payload) = value.get("payload").and_then(Value::as_object) {
                 let kind = payload

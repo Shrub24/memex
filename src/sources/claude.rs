@@ -826,6 +826,8 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
                         .filter(|value| !value.is_empty())
                         .map(str::to_string),
                     tokens,
+                    credits: None,
+                    token_usage_available: true,
                     source_cost_usd: value.get("costUSD").and_then(|value| value.as_f64()),
                     cost_authoritative: false,
                     dedupe_confidence: if exact_dedupe { "exact" } else { "heuristic" },

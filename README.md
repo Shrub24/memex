@@ -72,6 +72,7 @@ tool. **Import into** creates a conversation in another tool using the
 | Antigravity | Yes | No | Yes | No | No |
 | IBM Bob | Yes | Yes | Yes | No | No |
 | ZCode | Yes | Yes | No | No | No |
+| Kiro CLI | Yes | Credits only | No | No | No |
 | Hermes | No | Yes | No | No | No |
 
 - **History coverage depends on the local records a tool saves.** Cursor history
@@ -80,10 +81,12 @@ tool. **Import into** creates a conversation in another tool using the
   does not decrypt encrypted trajectories. Its token counters are not yet supported.
   ZCode reads `~/.zcode/cli/db/db.sqlite`, which its SSH-attached runtimes also
   write on remote hosts; `ZCODE_HOME` (comma-separated) indexes extra stores.
+  Kiro reads `~/.kiro/sessions`; set `KIRO_SESSIONS_DIR` for copied sessions.
 - **Token usage is opt-in and depends on recorded counters.** Cost estimates are
   not subscription charges or quota balances. Hermes support reads usage counters
   and metadata only, not message content. Copilot usage requires local OpenTelemetry
   export files; session transcripts alone do not supply its usage data.
+  Kiro reports credits separately because its records do not contain token counts or costs.
 - **Resume uses per-engine commands**, configurable in Memex. Cursor uses
   `cursor-agent`; Antigravity uses `agy` or `antigravity`. A supported command does
   not guarantee every historical session remains resumable in newer tool versions.

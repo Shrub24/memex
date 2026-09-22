@@ -1543,6 +1543,9 @@ fn resolve_cwd_from_source(records: &[Record]) -> Option<PathBuf> {
         SourceKind::Jcode => {
             crate::sources::jcode::cwd_from_jcode_session(Path::new(&first.source_path))
         }
+        SourceKind::Kiro => {
+            crate::sources::kiro::session_cwd(Path::new(&first.source_path)).map(PathBuf::from)
+        }
         SourceKind::Muse => {
             crate::sources::muse::cwd_from_muse_session(Path::new(&first.source_path))
         }

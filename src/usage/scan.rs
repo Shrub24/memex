@@ -136,6 +136,10 @@ pub(crate) fn source_spec(filter: SourceFilter) -> SourceSpec {
             parser_version: crate::sources::zcode::VERSIONS.usage,
             volatile_reuse_ms: no_volatile_reuse,
         },
+        SourceFilter::Kiro => SourceSpec {
+            parser_version: crate::sources::kiro::VERSIONS.usage,
+            volatile_reuse_ms: no_volatile_reuse,
+        },
     }
 }
 
@@ -176,6 +180,10 @@ pub(crate) fn source_files(filter: SourceFilter) -> Vec<PathBuf> {
         SourceFilter::Antigravity => crate::sources::antigravity::usage_files(),
         SourceFilter::Bob => crate::sources::bob::usage_files(),
         SourceFilter::Zcode => crate::sources::zcode::usage_files(),
+        SourceFilter::Kiro => crate::sources::kiro::discover()
+            .into_iter()
+            .map(|file| file.path)
+            .collect(),
     }
 }
 
@@ -502,6 +510,7 @@ pub(crate) fn parse_source_file(
         SourceFilter::Antigravity => {
             crate::sources::antigravity::parse_usage_file(path).map(FileParse::cacheable)
         }
+        SourceFilter::Kiro => crate::sources::kiro::parse_usage_file(path),
     }
 }
 
@@ -845,12 +854,34 @@ fn scan_zcode(
     Ok(())
 }
 
+fn scan_kiro(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
+    let files = source_files(SourceFilter::Kiro);
+    scan_files_cached(
+        SourceScan {
+            source: "kiro",
+            parser_version: crate::sources::kiro::VERSIONS.usage,
+            volatile_reuse_ms: no_volatile_reuse,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        crate::sources::kiro::parse_usage_file,
+    );
+    warnings.push("Kiro reports credits; token usage and dollar costs are unavailable.".into());
+    Ok(())
+}
+
 pub(crate) type SourceScanner =
     fn(&mut Vec<UsageEvent>, &mut Vec<String>, Option<&mut UsageCache>) -> Result<()>;
 
 /// Scanner ordinals double as merge tiebreaks: partitions are laid out and merged in
 /// this order, reproducing the combined assembly's stable sort exactly.
-pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 15] = [
+pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 16] = [
     (SourceFilter::Claude, scan_claude),
     (SourceFilter::Codex, scan_codex),
     (SourceFilter::Opencode, scan_opencode),
@@ -866,6 +897,7 @@ pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 15] = [
     (SourceFilter::Antigravity, scan_antigravity),
     (SourceFilter::Bob, scan_bob),
     (SourceFilter::Zcode, scan_zcode),
+    (SourceFilter::Kiro, scan_kiro),
 ];
 
 /// Scan and reconcile one source partition. Shared by combined assembly and
@@ -904,6 +936,7 @@ pub(crate) fn reconcile_source_partition(filter: SourceFilter, events: &mut Vec<
         SourceFilter::Cursor => crate::sources::cursor::reconcile_usage(events),
         SourceFilter::Copilot => crate::sources::copilot::reconcile_usage(events),
         SourceFilter::Opencode => crate::sources::opencode::reconcile_usage(events),
+        SourceFilter::Kiro => crate::sources::kiro::reconcile_usage(events),
         _ => {}
     }
 }
