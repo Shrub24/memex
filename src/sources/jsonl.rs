@@ -1,3 +1,54 @@
+use std::io::BufRead;
+use std::path::Path;
+
+/// Working directory for a JSONL transcript that records one in its lines.
+///
+/// Most sources keep a top-level `cwd` (or, for Codex, a `payload.cwd` on the
+/// `session_meta` header). A line whose `sessionId` matches the session wins;
+/// otherwise the first cwd seen is the fallback. Sources that store the cwd
+/// elsewhere (SQLite stores, sidecar files) extract it themselves.
+pub(super) fn scan_session_cwd(path: &Path, session_id: &str) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut fallback = None;
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let cwd = value
+            .get("cwd")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                value
+                    .get("payload")
+                    .and_then(|payload| payload.get("cwd"))
+                    .and_then(|value| value.as_str())
+            })
+            .map(str::to_string);
+        if fallback.is_none() {
+            fallback.clone_from(&cwd);
+        }
+        let session_id_match = value
+            .get("sessionId")
+            .or_else(|| value.get("session_id"))
+            .and_then(|value| value.as_str())
+            .is_some_and(|id| id == session_id);
+        if session_id_match && cwd.is_some() {
+            return cwd;
+        }
+        // Codex `session_meta` and Pi `session` headers carry the session cwd
+        // regardless of whether they repeat the session id.
+        if matches!(
+            value.get("type").and_then(|value| value.as_str()),
+            Some("session_meta" | "session")
+        ) && cwd.is_some()
+        {
+            return cwd;
+        }
+    }
+    fallback
+}
+
 pub(super) fn resume_offset(
     bytes: &[u8],
     offset: u64,
@@ -26,6 +77,41 @@ mod tests {
     use std::io::Write;
     use std::path::Path;
     use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn scan_session_cwd_prefers_session_match_and_headers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            "{\"cwd\":\"/first\"}\n{\"sessionId\":\"other\",\"cwd\":\"/other\"}\n",
+        )
+        .unwrap();
+        // Without a session-id match the first recorded cwd is the fallback.
+        assert_eq!(
+            super::scan_session_cwd(&path, "session"),
+            Some("/first".to_string())
+        );
+        std::fs::write(&path, r#"{"sessionId":"session","cwd":"/mine"}"#).unwrap();
+        assert_eq!(
+            super::scan_session_cwd(&path, "session"),
+            Some("/mine".to_string())
+        );
+        // Codex `session_meta` headers carry the cwd without a session id.
+        std::fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"id":"session","cwd":"/work/new"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::scan_session_cwd(&path, "session"),
+            Some("/work/new".to_string())
+        );
+        assert_eq!(
+            super::scan_session_cwd(&temp.path().join("absent"), "s"),
+            None
+        );
+    }
 
     // Claude is absent on purpose: its parser stops at the byte boundary discovery
     // captured and retries a tail only when the JSON error is truncation, so that a late

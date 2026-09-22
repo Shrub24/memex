@@ -174,6 +174,24 @@ pub struct LocatedMemoryHit {
 pub struct SessionContext {
     pub records: Vec<Record>,
     pub cwd: Option<String>,
+    /// Safe resume destination selected on the machine that owns the session.
+    /// Absent in responses from older peers; never substitute a client path.
+    #[serde(default)]
+    pub resume_cwd: Option<String>,
+}
+
+impl SessionContext {
+    fn new(records: Vec<Record>, source_path: &str, session_id: &str) -> Self {
+        let path = std::path::Path::new(source_path);
+        let cwd = discover_cwd(path, session_id);
+        let source_dir = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+        let resume_cwd = crate::resume::resume_cwd(cwd.clone(), &source_dir.to_string_lossy());
+        Self {
+            records,
+            cwd,
+            resume_cwd: Some(resume_cwd),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -999,10 +1017,11 @@ pub fn session_context(
 ) -> Result<SessionContext> {
     if machine_id == LOCAL_MACHINE_ID {
         let index = SearchIndex::open_or_create(&paths.index)?;
-        return Ok(SessionContext {
-            records: records_for_session(&index, session_id, source_path)?,
-            cwd: discover_cwd(std::path::Path::new(source_path), session_id),
-        });
+        return Ok(SessionContext::new(
+            records_for_session(&index, session_id, source_path)?,
+            source_path,
+            session_id,
+        ));
     }
     let machine = config
         .machines
@@ -2276,10 +2295,7 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
             let index = SearchIndex::open_or_create(&paths.index)?;
             let records = records_for_session(&index, &session_id, &source_path)?;
             Ok(RpcPayload::Session {
-                context: SessionContext {
-                    records,
-                    cwd: discover_cwd(std::path::Path::new(&source_path), &session_id),
-                },
+                context: SessionContext::new(records, &source_path, &session_id),
             })
         }
         RpcOperation::Show { doc_id } => {
@@ -3108,41 +3124,11 @@ fn records_for_session_page(
 }
 
 fn discover_cwd(path: &std::path::Path, session_id: &str) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    let mut fallback = None;
-    for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        let cwd = value
-            .get("cwd")
-            .and_then(|value| value.as_str())
-            .or_else(|| {
-                value
-                    .get("payload")
-                    .and_then(|payload| payload.get("cwd"))
-                    .and_then(|value| value.as_str())
-            })
-            .map(str::to_string);
-        if fallback.is_none() {
-            fallback.clone_from(&cwd);
-        }
-        let matches_session = value
-            .get("sessionId")
-            .and_then(|value| value.as_str())
-            .or_else(|| value.get("session_id").and_then(|value| value.as_str()))
-            .is_some_and(|id| id == session_id);
-        if matches_session && cwd.is_some() {
-            return cwd;
-        }
-        if value.get("type").and_then(|value| value.as_str()) == Some("session_meta")
-            && cwd.is_some()
-        {
-            return cwd;
-        }
-    }
-    fallback
+    crate::sources::session_cwd(
+        crate::sources::classify_path(&path.to_string_lossy()),
+        path,
+        session_id,
+    )
 }
 
 fn rpc_records(
@@ -3497,6 +3483,56 @@ mod tests {
     use crate::types::{RecordLinks, SourceKind};
     use tempfile::TempDir;
 
+    #[test]
+    fn session_context_selects_resume_directory_on_owning_machine() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::env_lock();
+        let server = temp.path().join("server");
+        let client = temp.path().join("client");
+        let wire_responses = {
+            let _env = crate::test_support::pin_source_roots(&server);
+            let store = server.join("CODEX_HOME/sessions/2026/09");
+            std::fs::create_dir_all(&store).unwrap();
+            let path = store.join("session.jsonl");
+            let worktree = server.join("CODEX_HOME/worktrees/24d4/memex");
+            let cases = [
+                (None, server.join("HOME")),
+                (Some(store.clone()), server.join("HOME")),
+                (Some(worktree.clone()), worktree),
+            ];
+            cases
+                .into_iter()
+                .map(|(cwd, expected)| {
+                    std::fs::write(
+                        &path,
+                        serde_json::json!({"type": "session_meta", "payload": {"cwd": cwd}})
+                            .to_string(),
+                    )
+                    .unwrap();
+                    let context = SessionContext::new(Vec::new(), path.to_str().unwrap(), "s1");
+                    // Factual cwd stays distinct from the safe fallback.
+                    assert_eq!(
+                        context.cwd,
+                        cwd.map(|dir| dir.to_string_lossy().into_owned())
+                    );
+                    (serde_json::to_string(&context).unwrap(), expected)
+                })
+                .collect::<Vec<_>>()
+        };
+        let _env = crate::test_support::pin_source_roots(&client);
+        for (wire, expected) in wire_responses {
+            let context: SessionContext = serde_json::from_str(&wire).unwrap();
+            assert_eq!(context.resume_cwd.as_deref(), expected.to_str());
+        }
+    }
+
+    #[test]
+    fn legacy_session_context_does_not_claim_a_safe_resume_directory() {
+        let context: SessionContext =
+            serde_json::from_str(r#"{"records":[],"cwd":"/remote/.codex/sessions"}"#).unwrap();
+        assert!(context.resume_cwd.is_none());
+        assert_eq!(context.cwd.as_deref(), Some("/remote/.codex/sessions"));
+    }
     fn activity_progress_child(script: &str) -> std::process::Child {
         Command::new("sh")
             .args(["-c", script])

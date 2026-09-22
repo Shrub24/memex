@@ -296,6 +296,62 @@ pub fn versions(source: SourceKind) -> ParserVersions {
     }
 }
 
+/// Best-effort working directory for a session transcript.
+///
+/// Sources that record the cwd somewhere other than a JSONL line (SQLite
+/// stores, protobuf payloads, sidecar files) extract it themselves; every
+/// other format shares the generic `cwd` scan. Callers fall back to their own
+/// last resort when this returns `None`.
+pub fn session_cwd(source: SourceKind, path: &Path, session_id: &str) -> Option<String> {
+    match source {
+        SourceKind::Antigravity => {
+            antigravity::session_cwd(path).map(|cwd| cwd.to_string_lossy().into_owned())
+        }
+        SourceKind::Bob => bob::session_cwd(path).map(|cwd| cwd.to_string_lossy().into_owned()),
+        SourceKind::Copilot => copilot::session_cwd(path),
+        _ => jsonl::scan_session_cwd(path, session_id),
+    }
+}
+
+/// True when a directory lies inside a transcript store owned by a supported
+/// source rather than in a user workspace. Resume commands must never treat
+/// such a directory as a session cwd: CLIs such as antigravity would ask the
+/// user to trust an agent's own state store as a project.
+pub fn is_state_store_dir(dir: &Path) -> bool {
+    let home = common::home();
+    state_store_roots()
+        .into_iter()
+        // A source configured to keep transcripts directly in `$HOME` (pi's
+        // `sessionDir = "~"`) must not make the whole home directory internal.
+        .filter(|root| root != &home && root.as_os_str() != "/")
+        .any(|root| dir.starts_with(root))
+}
+
+fn state_store_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    roots.extend(crate::config::default_claude_sources());
+    // CODEX_HOME also owns real workspaces under worktrees/. Only its
+    // transcript directories are unsafe resume destinations.
+    roots.extend(
+        codex::homes()
+            .into_iter()
+            .flat_map(|home| [home.join("sessions"), home.join("archived_sessions")]),
+    );
+    roots.push(cursor::projects_root());
+    roots.extend(opencode::data_roots());
+    roots.push(pi::sessions_root());
+    roots.extend(omp::session_roots());
+    roots.extend(openclaw::state_dirs());
+    roots.push(copilot::root());
+    roots.push(grok::root());
+    roots.extend(hermes::profile_roots());
+    roots.push(jcode::sessions_root());
+    roots.push(muse::sessions_root());
+    roots.extend(antigravity::profile_roots());
+    roots.extend(bob::roots());
+    roots
+}
+
 pub fn index_state_version(source: SourceKind) -> u32 {
     index_state_version_for(source, false)
 }
@@ -361,6 +417,64 @@ pub fn classify_path(path: &str) -> SourceKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{EnvVarGuard, env_lock, pin_source_roots};
+
+    #[test]
+    fn session_cwd_dispatches_source_specific_extraction() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = env_lock();
+        let _env = pin_source_roots(temp.path());
+        // Antigravity keeps the cwd inside tool-call arguments, not in a
+        // top-level `cwd` key the generic scan could find.
+        let transcript = temp.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"PLANNER_RESPONSE","tool_calls":[{"name":"run_command","args":{"Cwd":"/work/repo"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            session_cwd(SourceKind::Antigravity, &transcript, "any"),
+            Some("/work/repo".to_string())
+        );
+        // Formats with a plain top-level `cwd` use the generic scan.
+        let jsonl = temp.path().join("session.jsonl");
+        std::fs::write(&jsonl, r#"{"sessionId":"s1","cwd":"/work/claude"}"#).unwrap();
+        assert_eq!(
+            session_cwd(SourceKind::Claude, &jsonl, "s1"),
+            Some("/work/claude".to_string())
+        );
+    }
+
+    #[test]
+    fn state_store_dirs_are_detected_from_source_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = env_lock();
+        let _env = pin_source_roots(temp.path());
+        // Transcript stores of any source are internal, wherever the roots
+        // are configured to live...
+        assert!(is_state_store_dir(&temp.path().join(
+            "ANTIGRAVITY_HOME/antigravity-cli/brain/id/.system_generated/logs"
+        )));
+        assert!(is_state_store_dir(
+            &temp.path().join("CODEX_HOME/sessions/2026/09")
+        ));
+        assert!(is_state_store_dir(
+            &temp.path().join("CODEX_HOME/archived_sessions/2026/09")
+        ));
+        assert!(!is_state_store_dir(
+            &temp.path().join("CODEX_HOME/worktrees/24d4/memex")
+        ));
+        assert!(is_state_store_dir(
+            &temp.path().join("CLAUDE_CONFIG_DIR/projects/encoded-slug")
+        ));
+        // ...while user workspaces stay resumable, even inside the same parent.
+        assert!(!is_state_store_dir(&temp.path().join("my-repo")));
+        // A source configured to keep transcripts directly in $HOME must not
+        // make the whole home directory internal.
+        let home = common::home();
+        let _env_home = EnvVarGuard::set(&[("PI_CODING_AGENT_SESSION_DIR", home.to_str())]);
+        assert!(!is_state_store_dir(&home));
+    }
 
     #[test]
     fn reasoning_mode_is_part_of_index_state_version() {

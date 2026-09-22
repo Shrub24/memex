@@ -27,7 +27,6 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::io::BufRead;
 #[cfg(not(unix))]
 use std::io::Stdout;
 use std::io::Write;
@@ -2592,19 +2591,29 @@ impl App {
             return Ok(());
         };
         let cwd = if remote {
-            session_context(
+            let context = match session_context(
                 &self.paths,
                 &self.config,
                 &session.machine,
                 &session.session_id,
                 &session.source_path,
-            )
-            .ok()
-            .and_then(|context| context.cwd)
+            ) {
+                Ok(context) => context,
+                Err(err) => {
+                    self.set_status(format!("cannot resolve remote resume directory: {err}"));
+                    return Ok(());
+                }
+            };
+            let Some(cwd) = context.resume_cwd.filter(|dir| !dir.is_empty()) else {
+                self.set_status(
+                    "remote resume directory unavailable; update memex on the remote machine",
+                );
+                return Ok(());
+            };
+            cwd
         } else {
-            resolve_session_cwd(&session)
-        }
-        .unwrap_or_else(|| session.source_dir.clone());
+            crate::resume::resume_cwd(resolve_session_cwd(&session), &session.source_dir)
+        };
         let local_command = expand_resume_template(&template, &session, &cwd);
         let command = if remote {
             let machine = machine_by_id(&self.config, &session.machine)
@@ -6641,69 +6650,11 @@ fn parent_dir(path: &str) -> String {
 }
 
 fn resolve_session_cwd(session: &SessionSummary) -> Option<String> {
-    if session.source == SourceKind::Copilot
-        && let Some(cwd) = resolve_copilot_workspace_cwd(session)
-    {
-        return Some(cwd);
-    }
-    if session.source == SourceKind::Bob {
-        // Virtual `<db>/<task_id>` paths are not transcripts; ask the database.
-        return crate::sources::bob::session_cwd(std::path::Path::new(&session.source_path))
-            .map(|cwd| cwd.to_string_lossy().into_owned());
-    }
-    let file = std::fs::File::open(&session.source_path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    let mut fallback: Option<String> = None;
-    for line in reader.lines().map_while(Result::ok) {
-        let value: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let cwd = value
-            .get("cwd")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        if fallback.is_none() {
-            fallback = cwd.clone();
-        }
-
-        let session_id_match = value
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .or_else(|| value.get("session_id").and_then(|v| v.as_str()))
-            .map(|s| s == session.session_id)
-            .unwrap_or(false);
-
-        if session_id_match && cwd.is_some() {
-            return cwd;
-        }
-
-        if session.source == SourceKind::Codex
-            && value.get("type").and_then(|v| v.as_str()) == Some("session_meta")
-        {
-            let payload_cwd = value
-                .get("payload")
-                .and_then(|v| v.get("cwd"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            if payload_cwd.is_some() {
-                return payload_cwd;
-            }
-        }
-
-        if session.source == SourceKind::Pi
-            && value.get("type").and_then(|v| v.as_str()) == Some("session")
-        {
-            let cwd = value
-                .get("cwd")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            if cwd.is_some() {
-                return cwd;
-            }
-        }
-    }
-    fallback
+    crate::sources::session_cwd(
+        session.source,
+        std::path::Path::new(&session.source_path),
+        &session.session_id,
+    )
 }
 fn collect_projects(index: &SearchIndex, source: Option<SourceFilter>) -> Result<Vec<String>> {
     let mut set = HashSet::new();
@@ -7087,51 +7038,6 @@ fn list_index_from_mouse(pos: ratatui::layout::Position, area: Rect, len: usize)
     if row < len { Some(row) } else { None }
 }
 
-#[derive(Default)]
-struct CopilotWorkspaceCwd {
-    cwd: Option<String>,
-    git_root: Option<String>,
-}
-
-fn resolve_copilot_workspace_cwd(session: &SessionSummary) -> Option<String> {
-    let workspace_path = std::path::Path::new(&session.source_path)
-        .parent()?
-        .join("workspace.yaml");
-    let contents = std::fs::read_to_string(workspace_path).ok()?;
-    let workspace = parse_copilot_workspace_cwd(&contents);
-    workspace.cwd.or(workspace.git_root)
-}
-
-fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
-    let mut workspace = CopilotWorkspaceCwd::default();
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty()
-            || trimmed.starts_with('#')
-            || line.chars().next().is_some_and(|c| c.is_whitespace())
-        {
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once(':') else {
-            continue;
-        };
-        let value = value
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_string();
-        if value.is_empty() {
-            continue;
-        }
-        match key.trim() {
-            "cwd" => workspace.cwd = Some(value),
-            "gitRoot" | "git_root" => workspace.git_root = Some(value),
-            _ => {}
-        }
-    }
-    workspace
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7181,6 +7087,33 @@ mod tests {
             },
         );
         (tmp, app)
+    }
+
+    #[test]
+    fn resolve_session_cwd_reads_antigravity_tool_cwd() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("transcript.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"PLANNER_RESPONSE","tool_calls":[{"name":"run_command","args":{"Cwd":"/work/repo"}}]}"#,
+        )
+        .expect("write transcript");
+        let session = SessionSummary {
+            machine: LOCAL_MACHINE_ID.to_string(),
+            session_id: "session".to_string(),
+            project: "repo".to_string(),
+            source: SourceKind::Antigravity,
+            last_ts: 0,
+            hit_count: 0,
+            top_score: 0.0,
+            title: String::new(),
+            snippet: String::new(),
+            source_path: path.to_string_lossy().into_owned(),
+            source_dir: temp.path().to_string_lossy().into_owned(),
+            label: None,
+            conversation_kind: None,
+        };
+        assert_eq!(resolve_session_cwd(&session).as_deref(), Some("/work/repo"));
     }
 
     #[test]

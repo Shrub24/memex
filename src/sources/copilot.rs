@@ -35,6 +35,41 @@ pub fn session_root() -> PathBuf {
     root().join("session-state")
 }
 
+/// Working directory for a Copilot session: the sibling `workspace.yaml`
+/// records the `cwd` (or at least the `gitRoot`) the session ran in.
+pub fn session_cwd(path: &Path) -> Option<String> {
+    let workspace_path = path.parent()?.join("workspace.yaml");
+    let contents = std::fs::read_to_string(workspace_path).ok()?;
+    let mut cwd = None;
+    let mut git_root = None;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || line.chars().next().is_some_and(|c| c.is_whitespace())
+        {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let value = value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "cwd" => cwd = Some(value),
+            "gitRoot" | "git_root" => git_root = Some(value),
+            _ => {}
+        }
+    }
+    cwd.or(git_root)
+}
+
 pub fn discover_sessions() -> Vec<SourceFile> {
     discover_sessions_from_root(&session_root())
 }

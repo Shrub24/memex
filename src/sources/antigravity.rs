@@ -72,6 +72,12 @@ pub fn sessions_root() -> PathBuf {
         .unwrap_or_else(|| super::common::home().join(".gemini"))
 }
 
+/// Profile roots under [`sessions_root`] (for example `~/.gemini/antigravity-cli`).
+pub(crate) fn profile_roots() -> Vec<PathBuf> {
+    let base = sessions_root();
+    PROFILES.iter().map(|profile| base.join(profile)).collect()
+}
+
 pub(crate) fn is_db_path(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("db")
         && !is_wal_or_shm(path.file_name().and_then(|n| n.to_str()).unwrap_or(""))

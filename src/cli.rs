@@ -5402,7 +5402,9 @@ pub(crate) fn session_resume_command(
 ) -> Option<(String, String)> {
     let template = crate::resume::resume_template(config, row.source, false)?;
     let source_dir = source_dir_of(&row.source_path);
-    let cwd = row.cwd.clone().unwrap_or_else(|| source_dir.clone());
+    // Transcript stores are never workspaces: falling back into one makes the
+    // resumed CLI ask the user to trust an agent's internal state directory.
+    let cwd = crate::resume::resume_cwd(row.cwd.clone(), &source_dir);
     let command = crate::resume::expand_resume_template(
         &template,
         &crate::resume::ResumeSession {

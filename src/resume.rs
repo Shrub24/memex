@@ -8,7 +8,7 @@
 
 use crate::config::UserConfig;
 use crate::types::SourceKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Everything a template can reference about a session.
 pub struct ResumeSession<'a> {
@@ -17,6 +17,32 @@ pub struct ResumeSession<'a> {
     pub project: &'a str,
     pub source_path: &'a str,
     pub source_dir: &'a str,
+}
+
+/// True for directories inside a supported source's transcript store. A resume
+/// command must never `cd` into one: CLIs such as antigravity would ask the
+/// user to trust an agent's own state store as a project workspace.
+pub fn is_state_store_dir(dir: &str) -> bool {
+    crate::sources::is_state_store_dir(Path::new(dir))
+}
+
+/// Last-resort cwd for a resume command: the transcript's own directory when
+/// it could plausibly be a workspace, otherwise the user's home directory.
+pub fn fallback_resume_cwd(source_dir: &str) -> String {
+    if !source_dir.is_empty() && !is_state_store_dir(source_dir) {
+        source_dir.to_string()
+    } else {
+        crate::sources::common::home()
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// Select a resume directory using the environment of the machine that owns
+/// the session. Remote callers must use its result without applying local roots.
+pub fn resume_cwd(cwd: Option<String>, source_dir: &str) -> String {
+    cwd.filter(|dir| !dir.is_empty() && !is_state_store_dir(dir))
+        .unwrap_or_else(|| fallback_resume_cwd(source_dir))
 }
 
 /// The configured template for a source, falling back to built-in defaults.
@@ -162,6 +188,29 @@ mod tests {
     fn shell_quote_handles_empty_and_quotes() {
         assert_eq!(shell_quote(""), "''");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn fallback_resume_cwd_never_enters_state_stores() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::env_lock();
+        let _env = crate::test_support::pin_source_roots(temp.path());
+        let home = crate::sources::common::home()
+            .to_string_lossy()
+            .into_owned();
+        let brain_logs = temp
+            .path()
+            .join("ANTIGRAVITY_HOME/antigravity-cli/brain/id/.system_generated/logs")
+            .to_string_lossy()
+            .into_owned();
+        let workspace = temp.path().join("my-repo").to_string_lossy().into_owned();
+        assert!(is_state_store_dir(&brain_logs));
+        assert!(!is_state_store_dir(&workspace));
+        // A plausible transcript directory is kept as the last resort; agent
+        // state stores (and empty paths) fall back to the user's home.
+        assert_eq!(fallback_resume_cwd(&workspace), workspace);
+        assert_eq!(fallback_resume_cwd(&brain_logs), home);
+        assert_eq!(fallback_resume_cwd(""), home);
     }
 
     #[test]
