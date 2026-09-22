@@ -17,6 +17,9 @@ rustPlatform.buildRustPackage {
     lockFile = ../Cargo.lock;
   };
 
+  buildNoDefaultFeatures = true;
+  buildFeatures = [ "ort-load-dynamic" ];
+
   nativeBuildInputs = [
     pkg-config
     makeWrapper

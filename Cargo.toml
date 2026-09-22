@@ -8,7 +8,10 @@ license = "MIT"
 repository = "https://github.com/nicosuave/memex"
 
 [features]
-default = []
+default = ["ort-download-binaries"]
+# Nix supplies ONNX Runtime itself and builds with --no-default-features.
+ort-download-binaries = ["fastembed/ort-download-binaries-native-tls"]
+ort-load-dynamic = ["fastembed/ort-load-dynamic"]
 profiling = []
 cuda = ["ort/cuda", "dep:libloading"]
 
@@ -18,8 +21,7 @@ clap = { version = "4.5", features = ["derive"] }
 dialoguer = "0.11"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "5.0"
-# ort-load-dynamic: ONNX Runtime is a runtime dlopen, not a build-time download.
-fastembed = { version = "5.17.4", default-features = false, features = ["ort-load-dynamic", "hf-hub-native-tls"] }
+fastembed = { version = "5.17.4", default-features = false, features = ["hf-hub-native-tls"] }
 model2vec-rs = "0.1.4"
 # Keeps ort's download-binaries default off under feature unification.
 ort = { version = "2.0.0-rc.13", default-features = false, features = ["std"] }

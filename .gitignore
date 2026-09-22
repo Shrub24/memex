@@ -10,5 +10,5 @@ claude-code-transcripts/
 apps/macos/.build/
 apps/macos/build/
 .direnv/
-result
-result-*
+/result
+/result-*
