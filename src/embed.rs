@@ -68,6 +68,8 @@ pub enum ModelChoice {
     Gemma,
     /// PotionBase8M - 8M params, model2vec backend, tiny and fast
     Potion,
+    /// OpenAI-compatible remote endpoint (MEMEX_EMBEDDINGS_ENDPOINT)
+    Remote,
 }
 
 impl ModelChoice {
@@ -77,7 +79,7 @@ impl ModelChoice {
             ModelChoice::BGESmall => Some((EmbeddingModel::BGESmallENV15, 384)),
             ModelChoice::Nomic => Some((EmbeddingModel::NomicEmbedTextV15, 768)),
             ModelChoice::Gemma => Some((EmbeddingModel::EmbeddingGemma300M, 768)),
-            ModelChoice::Potion => None,
+            ModelChoice::Potion | ModelChoice::Remote => None,
         }
     }
 
@@ -91,8 +93,9 @@ impl ModelChoice {
             "potion" | "potion8m" | "potion-8m" | "potion-base-8m" | "model2vec" => {
                 Ok(ModelChoice::Potion)
             }
+            "remote" | "api" | "openai" => Ok(ModelChoice::Remote),
             _ => Err(anyhow!(
-                "unknown model '{s}', options: minilm, bge, nomic, gemma, potion"
+                "unknown model '{s}', options: minilm, bge, nomic, gemma, potion, remote"
             )),
         }
     }
@@ -104,6 +107,7 @@ impl ModelChoice {
             ModelChoice::Nomic => "nomic",
             ModelChoice::Gemma => "gemma",
             ModelChoice::Potion => "potion",
+            ModelChoice::Remote => "remote",
         }
     }
 
@@ -594,11 +598,18 @@ fn init_options_with_cuda(
 enum EmbedBackend {
     Fastembed(TextEmbedding),
     Model2Vec(StaticModel),
+    Remote(crate::remote::RemoteEmbedder),
 }
 
 pub struct EmbedderHandle {
     backend: EmbedBackend,
     pub dims: usize,
+}
+
+fn embedder_input_type() -> bool {
+    std::env::var("MEMEX_EMBEDDINGS_INPUT_TYPE")
+        .map(|value| !matches!(value.trim(), "0" | "false" | "no" | ""))
+        .unwrap_or(true)
 }
 
 impl EmbedderHandle {
@@ -612,6 +623,19 @@ impl EmbedderHandle {
         runtime: &EmbedRuntimeConfig,
     ) -> Result<Self> {
         crate::profiling::span!("embeddings.model_init");
+        if choice == ModelChoice::Remote {
+            let config = crate::remote::RemoteConfig::from_env()?.ok_or_else(|| {
+                anyhow!(
+                    "model=remote requires MEMEX_EMBEDDINGS_ENDPOINT and                      MEMEX_EMBEDDINGS_MODEL"
+                )
+            })?;
+            let embedder = crate::remote::RemoteEmbedder::new(config)?;
+            let dims = embedder.dims();
+            return Ok(Self {
+                backend: EmbedBackend::Remote(embedder),
+                dims,
+            });
+        }
         if let Some((model_type, dims)) = choice.fastembed_config() {
             let requested_provider = runtime.execution_provider;
             let effective_provider = requested_provider.effective();
@@ -657,6 +681,14 @@ impl EmbedderHandle {
             EmbedBackend::Model2Vec(model) => {
                 let input: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
                 Ok(model.encode_with_args(&input, Some(512), 64))
+            }
+            EmbedBackend::Remote(embedder) => {
+                let input_type = if embedder_input_type() {
+                    Some("document")
+                } else {
+                    None
+                };
+                embedder.embed(texts, input_type)
             }
         }
     }

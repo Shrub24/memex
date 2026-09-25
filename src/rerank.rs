@@ -16,6 +16,19 @@ pub(crate) const RERANK_MODEL_CHOICES: [&str; 4] = ["bge", "bge-m3", "jina", "ji
 pub(crate) struct RerankOptions {
     pub limit: usize,
     pub model: Option<String>,
+    /// Route rescoreing through the remote /rerank endpoint instead of the
+    /// local fastembed cross-encoder.
+    pub remote: bool,
+}
+
+impl RerankOptions {
+    pub(crate) fn new(limit: usize, model: Option<String>, remote: bool) -> Self {
+        Self {
+            limit,
+            model,
+            remote,
+        }
+    }
 }
 
 /// `--rerank` only affects the conversation corpus; memory corpora skip it.
@@ -75,20 +88,34 @@ fn order_by_score(scores: Vec<f32>) -> Vec<usize> {
     order
 }
 
-pub(crate) struct Reranker {
-    inner: TextRerank,
+pub(crate) enum Reranker {
+    Local { inner: Box<TextRerank> },
+    Remote(Box<crate::remote::RemoteReranker>),
 }
 
 impl Reranker {
-    pub(crate) fn new(embed_cache_dir: &Path, model: Option<&str>) -> Result<Self> {
+    pub(crate) fn new(
+        embed_cache_dir: &Path,
+        options: &RerankOptions,
+        remote_config: Option<crate::remote::RemoteConfig>,
+    ) -> Result<Self> {
+        if options.remote {
+            let config = remote_config.ok_or_else(|| {
+                anyhow!("remote rerank requires MEMEX_EMBEDDINGS_ENDPOINT to be configured")
+            })?;
+            return Ok(Self::Remote(Box::new(crate::remote::RemoteReranker::new(
+                config,
+                options.model.as_deref(),
+            )?)));
+        }
         std::fs::create_dir_all(embed_cache_dir)?;
-        let model_name = parse_rerank_model(model.unwrap_or("bge"))?;
-        let inner = TextRerank::try_new(
+        let model_name = parse_rerank_model(options.model.as_deref().unwrap_or("bge"))?;
+        let inner = Box::new(TextRerank::try_new(
             RerankInitOptions::new(model_name)
                 .with_cache_dir(PathBuf::from(embed_cache_dir))
                 .with_show_download_progress(false),
-        )?;
-        Ok(Self { inner })
+        )?);
+        Ok(Self::Local { inner })
     }
 
     /// Rescore `results` in place against `query`; preserves order on ties.
@@ -105,16 +132,22 @@ impl Reranker {
             .map(|located| document_text(&located.record))
             .collect();
         let document_refs: Vec<&str> = documents.iter().map(String::as_str).collect();
-        let mut scores: Vec<f32> = vec![0.0; documents.len()];
-        for hit in self.inner.rerank(query, &document_refs, false, None)? {
-            if hit.index >= scores.len() {
-                return Err(anyhow!(
-                    "reranker returned out-of-range document index {}",
-                    hit.index
-                ));
+        let scores: Vec<f32> = match self {
+            Reranker::Local { inner } => {
+                let mut scores: Vec<f32> = vec![0.0; documents.len()];
+                for hit in inner.rerank(query, &document_refs, false, None)? {
+                    if hit.index >= scores.len() {
+                        return Err(anyhow!(
+                            "reranker returned out-of-range document index {}",
+                            hit.index
+                        ));
+                    }
+                    scores[hit.index] = hit.score;
+                }
+                scores
             }
-            scores[hit.index] = hit.score;
-        }
+            Reranker::Remote(reranker) => reranker.rerank(query, &document_refs)?,
+        };
         for (position, located) in results.iter_mut().enumerate() {
             located.score = scores[position];
         }

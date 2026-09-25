@@ -347,6 +347,7 @@ fn search_memory_with_cache(
             None => config.resolve_model(None)?,
         };
         let runtime = config.resolve_embed_runtime()?;
+        config.apply_remote_embeddings_env()?;
         embedder = Some(EmbedderHandle::with_model_and_runtime(model, &runtime)?);
         vector = Some(loaded);
     }

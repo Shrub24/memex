@@ -199,7 +199,7 @@ struct IndexArgs {
     /// Skip embedding generation (overrides config default)
     #[arg(long, help_heading = "Embeddings")]
     no_embeddings: bool,
-    /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality), potion (tiny)
+    /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality), potion (tiny), remote (OpenAI-compatible endpoint)
     #[arg(long, help_heading = "Embeddings")]
     model: Option<String>,
     /// Path to memex data directory [default: ~/.memex]
@@ -285,7 +285,7 @@ EXAMPLES:
     /// Generate embeddings for semantic search (requires existing index)
     #[command(hide = true)]
     Embed {
-        /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality), potion (tiny)
+        /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality), potion (tiny), remote (OpenAI-compatible endpoint)
         #[arg(long)]
         model: Option<String>,
         /// Path to memex data directory [default: ~/.memex]
@@ -419,6 +419,9 @@ OUTPUT FIELDS (--fields):
             requires = "rerank"
         )]
         rerank_model: Option<String>,
+        /// Rerank via the configured remote /rerank endpoint (requires --rerank)
+        #[arg(long, help_heading = "Tuning", requires = "rerank")]
+        rerank_remote: bool,
     },
     /// Interactive terminal UI for browsing sessions
     Tui {
@@ -1460,6 +1463,7 @@ pub fn run() -> Result<()> {
             rerank,
             rerank_limit,
             rerank_model,
+            rerank_remote,
         } => {
             run_search(
                 query,
@@ -1495,6 +1499,7 @@ pub fn run() -> Result<()> {
                 rerank,
                 rerank_limit,
                 rerank_model,
+                rerank_remote,
             )?;
         }
         Commands::Tui {
@@ -2629,6 +2634,7 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
     // Model priority: CLI flag > config file > env var > default
     let model_choice = config.resolve_model(index.model.clone())?;
     let embed_runtime = config.resolve_embed_runtime()?;
+    config.apply_remote_embeddings_env()?;
     let tool_content_limits = config.indexed_tool_content_limits()?;
     let include_reasoning = index.include_reasoning || config.include_reasoning_default();
     let embeddings = resolve_flag(
@@ -2919,6 +2925,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     paths.ensure_dirs()?;
     let model_choice = config.resolve_model(model)?;
     let embed_runtime = config.resolve_embed_runtime()?;
+    config.apply_remote_embeddings_env()?;
     let lease = IngestLease::acquire_embedding(&paths, "embed", INGEST_LEASE_TIMEOUT)?;
     let index = SearchIndex::open_or_create(&paths.index)?;
     let report = crate::vector_backfill::run_with_lease(
@@ -2972,6 +2979,7 @@ fn run_search(
     rerank: bool,
     rerank_limit: Option<usize>,
     rerank_model: Option<String>,
+    rerank_remote: bool,
 ) -> Result<()> {
     crate::profiling::span!("cli.search");
     let format = if json_array && !verbose {
@@ -3044,9 +3052,12 @@ fn run_search(
         fields: search_fields(fields, full)?,
         sort,
         verbose,
-        rerank: rerank.then(|| crate::rerank::RerankOptions {
-            limit: rerank_limit.unwrap_or(crate::rerank::DEFAULT_RERANK_LIMIT),
-            model: rerank_model,
+        rerank: rerank.then(|| {
+            crate::rerank::RerankOptions::new(
+                rerank_limit.unwrap_or(crate::rerank::DEFAULT_RERANK_LIMIT),
+                rerank_model,
+                rerank_remote,
+            )
         }),
         format: if json_array && !verbose {
             SearchFormat::Json
@@ -3868,9 +3879,15 @@ fn collect_search_with_auto_index(
             .limit
             .clamp(1, crate::rerank::MAX_RERANK_LIMIT);
         let window_end = window.min(results.len());
+        let remote_config = if rerank_options.remote {
+            crate::remote::RemoteConfig::from_env()?
+        } else {
+            None
+        };
         let mut reranker = crate::rerank::Reranker::new(
             &paths.root.join("embed-cache"),
-            rerank_options.model.as_deref(),
+            rerank_options,
+            remote_config,
         )?;
         reranker.rerank_results(&query, &mut results[..window_end])?;
     }

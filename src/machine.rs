@@ -2716,6 +2716,7 @@ fn search_local(
                 return lexical_results(&index, &options, spec, now_ms);
             };
             let runtime = config.resolve_embed_runtime()?;
+            config.apply_remote_embeddings_env()?;
             let mut embedder = EmbedderHandle::with_model_and_runtime(model, &runtime)?;
             let embedding = embedder
                 .embed_texts(&[spec.query.as_str()])?
@@ -2745,6 +2746,7 @@ fn search_local(
                 ..options.clone()
             })?;
             let runtime = config.resolve_embed_runtime()?;
+            config.apply_remote_embeddings_env()?;
             let mut embedder = EmbedderHandle::with_model_and_runtime(model, &runtime)?;
             let embedding = embedder
                 .embed_texts(&[spec.query.as_str()])?

@@ -29,6 +29,43 @@ memex index --model minilm
 # or
 MEMEX_MODEL=minilm memex index
 ```
+## Remote embeddings (OpenAI-compatible)
+
+Set `model = "remote"` to embed via an OpenAI-compatible `/v1/embeddings`
+endpoint (Voyage, Jina, OpenAI, OpenRouter, local ollama/vLLM) instead of a
+local model. Remote search adds ~100-500ms per query; local models stay the
+default fast path.
+
+Config file:
+```toml
+model = "remote"
+embeddings_endpoint = "https://api.voyageai.com/v1"
+embeddings_model = "voyage-4-lite"
+embeddings_dimensions = 1024
+embeddings_input_type = true          # voyage/jina accept input_type; OpenAI schema servers need false
+embeddings_api_key_env = "MEMEX_EMBEDDINGS_API_KEY"  # env var holding the key
+```
+
+Or environment only:
+```sh
+export MEMEX_EMBEDDINGS_ENDPOINT=https://api.voyageai.com/v1
+export MEMEX_EMBEDDINGS_MODEL=voyage-4-lite
+export MEMEX_EMBEDDINGS_DIMENSIONS=1024   # required: fixed vector size
+export MEMEX_EMBEDDINGS_API_KEY=...
+memex index --embeddings --model remote
+```
+
+`embeddings_dimensions` is required — the vector index is size-locked, and
+switching models or dimensions triggers a re-embed of the corpus.
+
+## Remote reranking
+
+`search --rerank --rerank-remote` rescores via a Voyage/Jina-style `/v1/rerank`
+endpoint instead of the local cross-encoder. The rerank model comes from
+`--rerank-model` (e.g. `rerank-3`), falling back to `MEMEX_RERANKER_MODEL`
+(default `rerank-3-lite`). It reuses the embeddings endpoint and API key.
+Local rerank behavior (models bge/bge-m3/jina/jina-multilingual) is unchanged.
+
 ## Execution provider
 
 Select via `execution_provider` in config or `MEMEX_EXECUTION_PROVIDER`:

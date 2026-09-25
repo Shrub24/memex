@@ -111,8 +111,23 @@ pub struct UserConfig {
     pub include_reasoning: Option<bool>,
     /// Reconstruct token usage from local agent logs (disabled by default).
     pub token_usage: Option<bool>,
-    /// Embedding model: minilm, bge, nomic, gemma (default), potion
+    /// Embedding model: minilm, bge, nomic, gemma (default), potion, remote
     pub model: Option<String>,
+    /// Remote embeddings endpoint base URL ending at /v1 (OpenAI-compatible).
+    /// Enables model=remote; env MEMEX_EMBEDDINGS_ENDPOINT overrides.
+    pub embeddings_endpoint: Option<String>,
+    /// Env var holding the remote endpoint API key (default MEMEX_EMBEDDINGS_API_KEY).
+    pub embeddings_api_key_env: Option<String>,
+    /// Remote embedding model name (e.g. voyage-4-lite).
+    pub embeddings_model: Option<String>,
+    /// Remote embedding vector size. Required for model=remote.
+    pub embeddings_dimensions: Option<usize>,
+    /// Send input_type (query/document) to the remote endpoint. Default true;
+    /// turn off for servers that only implement the core OpenAI schema.
+    pub embeddings_input_type: Option<bool>,
+    /// Env var holding the remote /rerank endpoint API key when it differs
+    /// from the embeddings key.
+    pub reranker_api_key_env: Option<String>,
     /// Execution provider: auto, cpu, coreml, cuda
     pub execution_provider: Option<String>,
     /// CUDA device index when execution_provider is "cuda"
@@ -396,6 +411,62 @@ impl UserConfig {
 
     pub fn apply_embed_runtime_env(&self) -> Result<()> {
         self.resolve_embed_runtime()?.apply_env()?;
+        Ok(())
+    }
+
+    /// Resolve remote-embedding endpoint config: environment first
+    /// (MEMEX_EMBEDDINGS_*), then config file. Returns None when unset.
+    pub fn resolve_remote_embeddings(&self) -> Result<Option<crate::remote::RemoteConfig>> {
+        if std::env::var("MEMEX_EMBEDDINGS_ENDPOINT").is_ok() {
+            return crate::remote::RemoteConfig::from_env();
+        }
+        let Some(endpoint) = self.embeddings_endpoint.as_deref() else {
+            return Ok(None);
+        };
+        let model = self.embeddings_model.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("embeddings_endpoint is set but embeddings_model is missing")
+        })?;
+        let key_env = self
+            .embeddings_api_key_env
+            .as_deref()
+            .unwrap_or("MEMEX_EMBEDDINGS_API_KEY");
+        Ok(Some(crate::remote::RemoteConfig {
+            endpoint: endpoint.trim().trim_end_matches('/').to_string(),
+            api_key: std::env::var(key_env).unwrap_or_default(),
+            model: model.to_string(),
+            dimensions: self.embeddings_dimensions,
+            input_type: self.embeddings_input_type.unwrap_or(true),
+        }))
+    }
+
+    /// Export config-file remote settings as MEMEX_EMBEDDINGS_* so paths that
+    /// construct embedders without a `UserConfig` (machine.rs, memory_search.rs)
+    /// observe the same configuration. Environment values win.
+    pub fn apply_remote_embeddings_env(&self) -> Result<()> {
+        if let Some(config) = self.resolve_remote_embeddings()? {
+            unsafe {
+                if std::env::var_os("MEMEX_EMBEDDINGS_ENDPOINT").is_none() {
+                    std::env::set_var("MEMEX_EMBEDDINGS_ENDPOINT", &config.endpoint);
+                }
+                if std::env::var_os("MEMEX_EMBEDDINGS_MODEL").is_none() {
+                    std::env::set_var("MEMEX_EMBEDDINGS_MODEL", &config.model);
+                }
+                if std::env::var_os("MEMEX_EMBEDDINGS_API_KEY").is_none() {
+                    std::env::set_var("MEMEX_EMBEDDINGS_API_KEY", &config.api_key);
+                }
+                if let Some(dimensions) = config.dimensions
+                    && std::env::var_os("MEMEX_EMBEDDINGS_DIMENSIONS").is_none()
+                {
+                    std::env::set_var("MEMEX_EMBEDDINGS_DIMENSIONS", dimensions.to_string());
+                }
+                if std::env::var_os("MEMEX_EMBEDDINGS_INPUT_TYPE").is_none() {
+                    std::env::set_var(
+                        "MEMEX_EMBEDDINGS_INPUT_TYPE",
+                        if config.input_type { "1" } else { "0" },
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

@@ -68,6 +68,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 tower-http = { version = "0.6", features = ["cors"] }
 url = "2"
 hashbrown = "0.17.1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 # sha2 0.10 gates ARM64's runtime-detected SHA instructions behind this feature.
@@ -80,7 +81,6 @@ fsevent-sys = "4"
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
 
 [package.metadata.binstall]
 # `memex` is taken on crates.io, so installs run via
