@@ -358,6 +358,7 @@ memex search "your query" --format text
 | Fuzzy concepts | `search "concept" --mode semantic` |
 | Mixed | `search "term concept" --mode hybrid` |
 | Relevance refinement | `search "query" --rerank` |
+| Rerank via provider API | `search "query" --rerank --rerank-remote` |
 
 Lexical matching stems English words, so `migration` also finds `migrations` and `migrated`.
 Indexes built before stemming keep matching whole words until `memex index rebuild`; memory
@@ -382,8 +383,9 @@ envelope. Its identifiers remain searchable through the `event_id` field.
 - `--full` (all legacy search fields; conflicts with `--fields`)
 - `--mode lexical|semantic|hybrid`
 - `--rerank` (rescore the top results with a cross-encoder model; downloads on first use)
+- `--rerank-remote` (rescore with the remote rerank API configured by `rerank_base_url` instead; requires `--rerank`)
 - `--rerank-limit <n>` (how many top records to rerank, default 50, max 200; requires `--rerank`)
-- `--rerank-model bge|bge-m3|jina|jina-multilingual` (requires `--rerank`)
+- `--rerank-model <name>` (local: `bge|bge-m3|jina|jina-multilingual`, default `bge`; with `--rerank-remote`: the provider's model name; requires `--rerank`)
 - `--format jsonl|json|text|toon`
 - `--pretty` (pretty-print JSON output)
 

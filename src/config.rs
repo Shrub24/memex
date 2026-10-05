@@ -163,9 +163,14 @@ fn glob_directories(pattern: &Path) -> Vec<PathBuf> {
 }
 
 const DEFAULT_EMBEDDING_TIMEOUT_SECS: u64 = 60;
-const MAX_EMBEDDING_TIMEOUT_SECS: u64 = 600;
+const MAX_REMOTE_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_EMBEDDING_MAX_RETRIES: u32 = 3;
-const MAX_EMBEDDING_MAX_RETRIES: u32 = 10;
+const MAX_REMOTE_RETRIES: u32 = 10;
+const DEFAULT_RERANK_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_RERANK_MAX_RETRIES: u32 = 0;
+/// Key variable consulted when neither `rerank_api_key` nor `rerank_api_key_env`
+/// is set; embedding key variables are never consulted for reranking.
+const DEFAULT_RERANK_API_KEY_ENV: &str = "MEMEX_RERANK_API_KEY";
 /// Key variables consulted, in order, when neither `embedding_api_key` nor
 /// `embedding_api_key_env` is set.
 const DEFAULT_EMBEDDING_API_KEY_ENVS: [&str; 2] = ["MEMEX_EMBEDDING_API_KEY", "OPENAI_API_KEY"];
@@ -299,6 +304,20 @@ pub struct UserConfig {
     pub embedding_timeout_secs: Option<u64>,
     /// Retries for transient remote failures, 0..=10 (default 3).
     pub embedding_max_retries: Option<u32>,
+    /// Base URL of a Cohere/Voyage/Jina-style rerank API; required for
+    /// `--rerank-remote`. Requests go to `{base_url}/rerank`.
+    pub rerank_base_url: Option<String>,
+    /// Remote rerank model name, passed verbatim; required for `--rerank-remote`
+    /// unless `--rerank-model` is given. Never taken from the embedding `model`.
+    pub rerank_model: Option<String>,
+    /// Environment variable holding the remote rerank API key.
+    pub rerank_api_key_env: Option<String>,
+    /// Literal remote rerank API key; takes precedence over `rerank_api_key_env`.
+    pub rerank_api_key: Option<SecretString>,
+    /// Per-attempt remote rerank timeout in seconds, 1..=600 (default 10).
+    pub rerank_timeout_secs: Option<u64>,
+    /// Retries for transient remote rerank failures, 0..=10 (default 0).
+    pub rerank_max_retries: Option<u32>,
     /// Execution provider: auto, cpu, coreml, cuda
     pub execution_provider: Option<String>,
     /// CUDA device index when execution_provider is "cuda"
@@ -704,18 +723,18 @@ impl UserConfig {
         let timeout_secs = self
             .embedding_timeout_secs
             .unwrap_or(DEFAULT_EMBEDDING_TIMEOUT_SECS);
-        if !(1..=MAX_EMBEDDING_TIMEOUT_SECS).contains(&timeout_secs) {
+        if !(1..=MAX_REMOTE_TIMEOUT_SECS).contains(&timeout_secs) {
             return Err(anyhow!(
-                "embedding_timeout_secs must be between 1 and {MAX_EMBEDDING_TIMEOUT_SECS}, got \
+                "embedding_timeout_secs must be between 1 and {MAX_REMOTE_TIMEOUT_SECS}, got \
                  {timeout_secs}"
             ));
         }
         let max_retries = self
             .embedding_max_retries
             .unwrap_or(DEFAULT_EMBEDDING_MAX_RETRIES);
-        if max_retries > MAX_EMBEDDING_MAX_RETRIES {
+        if max_retries > MAX_REMOTE_RETRIES {
             return Err(anyhow!(
-                "embedding_max_retries must be between 0 and {MAX_EMBEDDING_MAX_RETRIES}, got \
+                "embedding_max_retries must be between 0 and {MAX_REMOTE_RETRIES}, got \
                  {max_retries}"
             ));
         }
@@ -751,6 +770,67 @@ impl UserConfig {
             }
         }
         Ok(None)
+    }
+
+    /// Independent endpoint for `--rerank-remote`.
+    pub fn resolve_remote_rerank(&self) -> Result<RemoteEndpoint> {
+        let base_url = self
+            .rerank_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "--rerank-remote requires rerank_base_url, for example \
+                     \"https://api.cohere.com/v2\""
+                )
+            })?;
+        let scheme = base_url.split_once("://").map(|(scheme, _)| scheme);
+        if !scheme.is_some_and(|scheme| {
+            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+        }) {
+            return Err(anyhow!(
+                "rerank_base_url must start with http:// or https://"
+            ));
+        }
+        let timeout_secs = self
+            .rerank_timeout_secs
+            .unwrap_or(DEFAULT_RERANK_TIMEOUT_SECS);
+        if !(1..=MAX_REMOTE_TIMEOUT_SECS).contains(&timeout_secs) {
+            return Err(anyhow!(
+                "rerank_timeout_secs must be between 1 and {MAX_REMOTE_TIMEOUT_SECS}, got \
+                 {timeout_secs}"
+            ));
+        }
+        let max_retries = self
+            .rerank_max_retries
+            .unwrap_or(DEFAULT_RERANK_MAX_RETRIES);
+        if max_retries > MAX_REMOTE_RETRIES {
+            return Err(anyhow!(
+                "rerank_max_retries must be between 0 and {MAX_REMOTE_RETRIES}, got {max_retries}"
+            ));
+        }
+        let endpoint = RemoteEndpoint {
+            base_url: base_url.to_string(),
+            api_key: self.resolve_rerank_api_key()?,
+            timeout: Duration::from_secs(timeout_secs),
+            max_retries,
+        };
+        endpoint.validate_for("rerank")?;
+        Ok(endpoint)
+    }
+
+    /// Resolve reranking credentials without falling back to embedding keys.
+    pub fn resolve_rerank_api_key(&self) -> Result<Option<String>> {
+        if let Some(key) = &self.rerank_api_key
+            && !key.expose().is_empty()
+        {
+            return Ok(Some(key.expose().to_string()));
+        }
+        if let Some(var) = self.rerank_api_key_env.as_deref() {
+            return api_key_from_env(var);
+        }
+        api_key_from_env(DEFAULT_RERANK_API_KEY_ENV)
     }
 
     pub fn apply_embed_runtime_env(&self) -> Result<()> {
@@ -1790,5 +1870,117 @@ mod tests {
             .resolve_embed_runtime()
             .expect("resolve remote runtime");
         assert!(!format!("{runtime:?}").contains("sk-literal"));
+    }
+
+    #[test]
+    fn rerank_endpoint_resolves_with_failsafe_defaults_and_bounds() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[("MEMEX_RERANK_API_KEY", None)]);
+        let config: UserConfig =
+            toml::from_str(r#"rerank_base_url = "https://api.cohere.com/v2""#).unwrap();
+        let endpoint = config
+            .resolve_remote_rerank()
+            .expect("resolve rerank endpoint");
+        assert_eq!(endpoint.base_url, "https://api.cohere.com/v2");
+        assert_eq!(endpoint.timeout, Duration::from_secs(10));
+        assert_eq!(endpoint.max_retries, 0);
+        assert_eq!(endpoint.api_key, None);
+
+        for (source, expected) in [
+            (
+                "rerank_base_url = \"https://example.test\"\nrerank_timeout_secs = 0",
+                "rerank_timeout_secs must be between 1 and 600",
+            ),
+            (
+                "rerank_base_url = \"https://example.test\"\nrerank_timeout_secs = 601",
+                "rerank_timeout_secs must be between 1 and 600",
+            ),
+            (
+                "rerank_base_url = \"https://example.test\"\nrerank_max_retries = 11",
+                "rerank_max_retries must be between 0 and 10",
+            ),
+            (
+                "rerank_base_url = \"ftp://example.com\"",
+                "rerank_base_url must start with http:// or https://",
+            ),
+            ("", "--rerank-remote requires rerank_base_url"),
+        ] {
+            let config: UserConfig = toml::from_str(source).unwrap();
+            let error = config
+                .resolve_remote_rerank()
+                .expect_err("must fail")
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let config: UserConfig = toml::from_str(
+            r#"
+            rerank_base_url = "http://127.0.0.1:9999"
+            rerank_timeout_secs = 600
+            rerank_max_retries = 10
+        "#,
+        )
+        .unwrap();
+        let endpoint = config.resolve_remote_rerank().expect("bounded overrides");
+        assert_eq!(endpoint.timeout, Duration::from_secs(600));
+        assert_eq!(endpoint.max_retries, 10);
+    }
+
+    #[test]
+    fn rerank_api_key_lookup_never_falls_back_to_embedding_keys() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[
+            ("MEMEX_RERANK_API_KEY", Some("rerank-fallback")),
+            ("MEMEX_EMBEDDING_API_KEY", Some("embedding-key")),
+            ("OPENAI_API_KEY", Some("openai-key")),
+            ("MEMEX_TEST_RERANK_KEY", Some("named-key")),
+            ("MEMEX_TEST_MISSING_KEY", None),
+        ]);
+        let literal = UserConfig {
+            rerank_api_key: Some(SecretString("literal-key".to_string())),
+            rerank_api_key_env: Some("MEMEX_TEST_RERANK_KEY".to_string()),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            literal
+                .resolve_rerank_api_key()
+                .expect("literal key")
+                .as_deref(),
+            Some("literal-key")
+        );
+        let named = UserConfig {
+            rerank_api_key_env: Some("MEMEX_TEST_RERANK_KEY".to_string()),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            named
+                .resolve_rerank_api_key()
+                .expect("named key")
+                .as_deref(),
+            Some("named-key")
+        );
+        let missing = UserConfig {
+            rerank_api_key_env: Some("MEMEX_TEST_MISSING_KEY".to_string()),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            missing.resolve_rerank_api_key().expect("missing named key"),
+            None
+        );
+        assert_eq!(
+            UserConfig::default()
+                .resolve_rerank_api_key()
+                .expect("rerank fallback")
+                .as_deref(),
+            Some("rerank-fallback")
+        );
+        let _env = EnvVarGuard::set(&[("MEMEX_RERANK_API_KEY", None)]);
+        assert_eq!(
+            UserConfig::default()
+                .resolve_rerank_api_key()
+                .expect("no key"),
+            None,
+            "embedding key variables must not leak into rerank"
+        );
     }
 }

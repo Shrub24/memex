@@ -482,10 +482,14 @@ OUTPUT FIELDS (--fields):
         /// Rescore the top results with a cross-encoder model (downloads on first use)
         #[arg(long, help_heading = "Tuning")]
         rerank: bool,
+        /// Rescore with the remote API at rerank_base_url instead of a local model (requires --rerank)
+        #[arg(long, help_heading = "Tuning", requires = "rerank")]
+        rerank_remote: bool,
         /// How many top records to rerank (default 50, max 200; requires --rerank)
         #[arg(long, value_name = "N", help_heading = "Tuning", requires = "rerank")]
         rerank_limit: Option<usize>,
-        /// Cross-encoder model: bge (default), bge-m3, jina, jina-multilingual (requires --rerank)
+        /// Cross-encoder model: bge (default), bge-m3, jina, jina-multilingual; with
+        /// --rerank-remote, the provider's model name (requires --rerank)
         #[arg(
             long,
             value_name = "MODEL",
@@ -1480,6 +1484,7 @@ pub fn run() -> Result<()> {
             machine,
             trace,
             rerank,
+            rerank_remote,
             rerank_limit,
             rerank_model,
         } => {
@@ -1515,6 +1520,7 @@ pub fn run() -> Result<()> {
                 machine,
                 trace,
                 rerank,
+                rerank_remote,
                 rerank_limit,
                 rerank_model,
             )?;
@@ -3059,6 +3065,7 @@ fn run_search(
     machines: Vec<String>,
     trace: bool,
     rerank: bool,
+    rerank_remote: bool,
     rerank_limit: Option<usize>,
     rerank_model: Option<String>,
 ) -> Result<()> {
@@ -3136,6 +3143,11 @@ fn run_search(
         rerank: rerank.then(|| crate::rerank::RerankOptions {
             limit: rerank_limit.unwrap_or(crate::rerank::DEFAULT_RERANK_LIMIT),
             model: rerank_model,
+            backend: if rerank_remote {
+                crate::rerank::RerankBackend::Remote
+            } else {
+                crate::rerank::RerankBackend::Local
+            },
         }),
         format: if json_array && !verbose {
             SearchFormat::Json
@@ -10214,6 +10226,35 @@ arguments = {
         assert!(
             Cli::try_parse_from(["memex", "search", "needle", "--rerank-model", "jina"]).is_err()
         );
+    }
+
+    #[test]
+    fn search_rerank_remote_requires_rerank() {
+        let cli = Cli::try_parse_from([
+            "memex",
+            "search",
+            "needle",
+            "--rerank",
+            "--rerank-remote",
+            "--rerank-model",
+            "rerank-v3.5",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Search {
+                rerank,
+                rerank_remote,
+                rerank_model,
+                ..
+            }) => {
+                assert!(rerank);
+                assert!(rerank_remote);
+                assert_eq!(rerank_model.as_deref(), Some("rerank-v3.5"));
+            }
+            _ => panic!("expected search command"),
+        }
+
+        assert!(Cli::try_parse_from(["memex", "search", "needle", "--rerank-remote"]).is_err());
     }
 
     #[test]
