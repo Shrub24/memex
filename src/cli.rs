@@ -3932,8 +3932,10 @@ fn collect_search_with_auto_index(
             limit,
             kind_filter,
         },
-        auto_index_local,
-        rerank_pass.as_mut(),
+        crate::search::CollectMode {
+            auto_index_local,
+            rerank: rerank_pass.as_mut(),
+        },
     )?;
     let results = collected.items;
     let query_candidate_counts = collected.query_candidate_counts;
@@ -3969,7 +3971,6 @@ struct RenderOptions {
     matchers: Vec<regex::Regex>,
     format: SearchFormat,
     fields: Option<HashSet<String>>,
-
 }
 
 #[derive(Serialize)]

@@ -103,14 +103,45 @@ pub(crate) enum Reranker {
     Remote(RemoteReranker),
 }
 
+/// One rerank scoring pass over prepared documents, shared by both backends so the
+/// pipeline can be exercised without a model.
+pub(crate) trait RerankScorer {
+    /// One score per document, in input order.
+    fn score(&mut self, query: &str, documents: &[String]) -> Result<Vec<f32>>;
+}
+
+impl RerankScorer for Reranker {
+    fn score(&mut self, query: &str, documents: &[String]) -> Result<Vec<f32>> {
+        match self {
+            Reranker::Local(inner) => {
+                let document_refs: Vec<&str> = documents.iter().map(String::as_str).collect();
+                let mut scores: Vec<f32> = vec![0.0; documents.len()];
+                for hit in inner.rerank(query, &document_refs, false, None)? {
+                    if hit.index >= scores.len() {
+                        bail!(
+                            "reranker returned out-of-range document index {}",
+                            hit.index
+                        );
+                    }
+                    scores[hit.index] = hit.score;
+                }
+                Ok(scores)
+            }
+            Reranker::Remote(remote) => {
+                let document_refs: Vec<&str> = documents.iter().map(String::as_str).collect();
+                remote.fetch_scores(query, &document_refs)
+            }
+        }
+    }
+}
+
 /// A rerank pass configured for one search and handed to the shared search pipeline.
 ///
 /// The pipeline reranks the fused candidate pool rather than the rendered page, so the
 /// rescoring sees the records retrieval actually ranked highest, not the ones left after
 /// the page was truncated.
 pub(crate) struct RerankPass {
-    reranker: Reranker,
-    /// How many leading records of the fused pool to rescore.
+    scorer: Box<dyn RerankScorer>,
     limit: usize,
 }
 
@@ -121,14 +152,37 @@ impl RerankPass {
         cache_dir: &Path,
     ) -> Result<Self> {
         Ok(Self {
-            reranker: Reranker::for_search(options, config, cache_dir)?,
+            scorer: Box::new(Reranker::for_search(options, config, cache_dir)?),
             limit: options.limit.clamp(1, MAX_RERANK_LIMIT),
         })
     }
 
+    /// Leading fused records this pass rescores, and therefore the pool retrieval must reach.
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+    }
+
     pub(crate) fn apply(&mut self, query: &str, results: &mut [LocatedRecord]) -> Result<()> {
         let window_end = self.limit.min(results.len());
-        self.reranker.rerank_results(query, &mut results[..window_end])
+        let window = &mut results[..window_end];
+        if window.len() < 2 {
+            return Ok(());
+        }
+        let documents = documents_for(window);
+        let scores = self.scorer.score(query, &documents)?;
+        apply_scores(window, scores);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl RerankPass {
+    /// A pass over an injected scorer, so pipeline tests need no model download.
+    pub(crate) fn with_scorer(scorer: Box<dyn RerankScorer>, limit: usize) -> Self {
+        Self {
+            scorer,
+            limit: limit.clamp(1, MAX_RERANK_LIMIT),
+        }
     }
 }
 
@@ -160,36 +214,6 @@ impl Reranker {
         )?;
         Ok(Self::Local(Box::new(inner)))
     }
-
-    /// Rescore `results` in place against `query`; preserves order on ties.
-    pub(crate) fn rerank_results(
-        &mut self,
-        query: &str,
-        results: &mut [LocatedRecord],
-    ) -> Result<()> {
-        if results.len() < 2 {
-            return Ok(());
-        }
-        match self {
-            Reranker::Local(inner) => {
-                let documents = documents_for(results);
-                let document_refs: Vec<&str> = documents.iter().map(String::as_str).collect();
-                let mut scores: Vec<f32> = vec![0.0; documents.len()];
-                for hit in inner.rerank(query, &document_refs, false, None)? {
-                    if hit.index >= scores.len() {
-                        return Err(anyhow!(
-                            "reranker returned out-of-range document index {}",
-                            hit.index
-                        ));
-                    }
-                    scores[hit.index] = hit.score;
-                }
-                apply_scores(results, scores);
-                Ok(())
-            }
-            Reranker::Remote(remote) => remote.rerank_results(query, results),
-        }
-    }
 }
 
 fn trimmed(value: Option<&str>) -> Option<&str> {
@@ -220,14 +244,6 @@ impl RemoteReranker {
             model: model.to_owned(),
             backoff_base: DEFAULT_BACKOFF_BASE,
         })
-    }
-
-    fn rerank_results(&self, query: &str, results: &mut [LocatedRecord]) -> Result<()> {
-        let documents = documents_for(results);
-        let document_refs: Vec<&str> = documents.iter().map(String::as_str).collect();
-        let scores = self.fetch_scores(query, &document_refs)?;
-        apply_scores(results, scores);
-        Ok(())
     }
 
     fn fetch_scores(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>> {
@@ -457,6 +473,16 @@ mod tests {
 
     const KEY: &str = "sk-rerank-SECRET-7f3a9c41";
 
+    /// Run one rerank pass over `results` exactly as the search pipeline does.
+    fn rerank_pass(
+        reranker: Reranker,
+        limit: usize,
+        query: &str,
+        results: &mut [LocatedRecord],
+    ) -> Result<()> {
+        RerankPass::with_scorer(Box::new(reranker), limit).apply(query, results)
+    }
+
     fn located(text: &str, score: f32) -> LocatedRecord {
         LocatedRecord {
             machine: "local".to_string(),
@@ -558,14 +584,13 @@ mod tests {
             model: None,
             backend: RerankBackend::Remote,
         };
-        let mut reranker =
-            Reranker::for_search(&options, &config, Path::new("unused-embed-cache"))?;
+        let reranker = Reranker::for_search(&options, &config, Path::new("unused-embed-cache"))?;
         let mut results = vec![
             located("first", 0.8),
             located("second", 0.7),
             located("third", 0.6),
         ];
-        reranker.rerank_results("needle", &mut results)?;
+        rerank_pass(reranker, 50, "needle", &mut results)?;
         let captured = join(server)?;
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].path, "/v1/rerank");
@@ -600,9 +625,9 @@ mod tests {
                 ]}),
             )
         })?;
-        let reranker = remote(&base, None, 0)?;
+        let reranker = Reranker::Remote(remote(&base, None, 0)?);
         let mut results = vec![located("a", 0.1), located("b", 0.1)];
-        reranker.rerank_results("q", &mut results)?;
+        rerank_pass(reranker, 50, "q", &mut results)?;
         join(server)?;
         let texts: Vec<&str> = results
             .iter()
@@ -645,20 +670,22 @@ mod tests {
                 "index 3 for 3 documents",
             ),
             (
-                "nonfinite",
+                // Upstream's precise f32 parsing rejects overflow while deserializing, so
+                // this never reaches the score validator.
+                "overflow",
                 three(
                     json!({"index": 0, "relevance_score": 1e39}),
                     json!({"index": 1, "relevance_score": 0.4}),
                     json!({"index": 2, "relevance_score": 0.1}),
                 ),
-                "non-finite score",
+                "number out of range",
             ),
         ];
         for (name, reply, expected) in cases {
             let (base, server) = serve(move |_, _| (200, reply.clone()))?;
-            let reranker = remote(&base, None, 0)?;
+            let reranker = Reranker::Remote(remote(&base, None, 0)?);
             let mut results = vec![located("a", 1.0), located("b", 1.0), located("c", 1.0)];
-            let error = expect_err(reranker.rerank_results("q", &mut results))?;
+            let error = expect_err(rerank_pass(reranker, 50, "q", &mut results))?;
             join(server)?;
             assert!(error.contains(expected), "{name}: {error}");
         }
@@ -673,9 +700,9 @@ mod tests {
                 json!({"error": {"message": format!("Incorrect API key provided: {KEY}")}}),
             )
         })?;
-        let reranker = remote(&base, Some(KEY), 0)?;
+        let reranker = Reranker::Remote(remote(&base, Some(KEY), 0)?);
         let mut results = vec![located("a", 1.0), located("b", 1.0)];
-        let error = expect_err(reranker.rerank_results("q", &mut results))?;
+        let error = expect_err(rerank_pass(reranker, 50, "q", &mut results))?;
         let captured = join(server)?;
         assert_eq!(captured.len(), 1, "zero retries means one attempt");
         assert!(error.contains("HTTP 401"), "{error}");
@@ -696,9 +723,9 @@ mod tests {
                 ]}),
             ),
         })?;
-        let reranker = remote(&base, None, 1)?;
+        let reranker = Reranker::Remote(remote(&base, None, 1)?);
         let mut results = vec![located("a", 1.0), located("b", 1.0)];
-        reranker.rerank_results("q", &mut results)?;
+        rerank_pass(reranker, 50, "q", &mut results)?;
         assert_eq!(join(server)?.len(), 2);
         assert_eq!(results[0].record.text, "b");
         Ok(())
