@@ -23,11 +23,12 @@ const MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
 const MAX_RETRIES: u32 = 10;
 const MAX_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_ERROR_MESSAGE_BYTES: usize = 512;
-const DEFAULT_BACKOFF_BASE: Duration = Duration::from_millis(500);
+pub(crate) const DEFAULT_BACKOFF_BASE: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const PROBE_TEXT: &str = "dimension probe";
 
-static PLAIN_HTTP_WARNING: Once = Once::new();
+static EMBEDDING_PLAIN_HTTP_WARNING: Once = Once::new();
+static RERANK_PLAIN_HTTP_WARNING: Once = Once::new();
 
 /// Connection settings for an OpenAI-compatible embeddings server.
 #[derive(Clone, PartialEq, Eq)]
@@ -54,44 +55,54 @@ impl fmt::Debug for RemoteEndpoint {
 }
 
 impl RemoteEndpoint {
+    /// [`Self::validate_for`] for the embedding backend.
+    pub fn validate(&self) -> Result<()> {
+        self.validate_for("embedding")
+    }
+
     /// Rejects base URLs that are not `http`/`https` with a non-empty host,
     /// that carry credentials, a query, or a fragment, or that use plain `http`
-    /// to a non-loopback host while an API key is set.
+    /// to a non-loopback host while an API key is set. `kind` names the backend
+    /// in errors and warnings (`embedding`, `rerank`).
     ///
     /// Plain `http` to a non-loopback host without an API key is accepted with
-    /// a warning on stderr, printed at most once per process.
-    pub fn validate(&self) -> Result<()> {
+    /// a warning on stderr, printed at most once per process and backend.
+    pub fn validate_for(&self, kind: &str) -> Result<()> {
         let url = url::Url::parse(&self.base_url)
-            .with_context(|| format!("invalid embedding base URL {:?}", self.base_url))?;
+            .with_context(|| format!("invalid {kind} base URL {:?}", self.base_url))?;
         if !matches!(url.scheme(), "http" | "https") {
             bail!(
-                "embedding base URL {:?} must use http or https, not {:?}",
+                "{kind} base URL {:?} must use http or https, not {:?}",
                 self.base_url,
                 url.scheme()
             );
         }
         if url.host_str().is_none_or(str::is_empty) {
-            bail!("embedding base URL {:?} has no host", self.base_url);
+            bail!("{kind} base URL {:?} has no host", self.base_url);
         }
         if !url.username().is_empty() || url.password().is_some() {
-            bail!("embedding base URL must not contain credentials; set the API key instead");
+            bail!("{kind} base URL must not contain credentials; set the API key instead");
         }
         if url.query().is_some() || url.fragment().is_some() {
             bail!(
-                "embedding base URL {:?} must not contain a query or fragment",
+                "{kind} base URL {:?} must not contain a query or fragment",
                 self.base_url
             );
         }
         if url.scheme() == "http" && !is_loopback(&url) {
             if self.bearer_key().is_some() {
                 bail!(
-                    "embedding base URL {:?} uses plain http to a non-local host; use https or a loopback host, because the API key would be sent in clear text",
+                    "{kind} base URL {:?} uses plain http to a non-local host; use https or a loopback host, because the API key would be sent in clear text",
                     self.base_url
                 );
             }
-            PLAIN_HTTP_WARNING.call_once(|| {
+            let warning = match kind {
+                "rerank" => &RERANK_PLAIN_HTTP_WARNING,
+                _ => &EMBEDDING_PLAIN_HTTP_WARNING,
+            };
+            warning.call_once(|| {
                 eprintln!(
-                    "warning: embedding_base_url uses plain http to a non-local host; transcript text is sent unencrypted"
+                    "warning: {kind}_base_url uses plain http to a non-local host; transcript text is sent unencrypted"
                 );
             });
         }
@@ -102,7 +113,7 @@ impl RemoteEndpoint {
         format!("{}/embeddings", self.base_url.trim_end_matches('/'))
     }
 
-    fn bearer_key(&self) -> Option<&str> {
+    pub(crate) fn bearer_key(&self) -> Option<&str> {
         self.api_key.as_deref().filter(|key| !key.is_empty())
     }
 }
@@ -166,7 +177,7 @@ enum ErrorDetail {
 }
 
 /// Outcome of one failed request attempt.
-enum AttemptError {
+pub(crate) enum AttemptError {
     /// 429, 5xx, timeout, or connection failure; `retry_after` is the server's
     /// hint, and `kind` is a short label free of server-supplied text.
     Transient {
@@ -176,6 +187,228 @@ enum AttemptError {
     },
     /// Failure that a retry cannot fix.
     Fatal(anyhow::Error),
+}
+
+/// Result of one bounded, key-sanitized HTTP POST.
+pub(crate) enum PostOutcome {
+    Success {
+        body: Vec<u8>,
+    },
+    Error {
+        status: u16,
+        retry_after: Option<Duration>,
+        message: String,
+    },
+}
+
+/// Agent with platform TLS, redirects disabled, and a global timeout.
+pub(crate) fn build_agent(timeout: Duration) -> Agent {
+    let tls = TlsConfig::builder()
+        .provider(TlsProvider::NativeTls)
+        .root_certs(RootCerts::PlatformVerifier)
+        .build();
+    Agent::config_builder()
+        .tls_config(tls)
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .timeout_global(Some(timeout))
+        .build()
+        .into()
+}
+
+/// POSTs `body` as JSON, reading success bodies up to the shared limit and
+/// error bodies up to 64 KiB. `kind` names the backend in errors.
+pub(crate) fn post_json(
+    agent: &Agent,
+    url: &str,
+    bearer_key: Option<&str>,
+    kind: &str,
+    body: &impl Serialize,
+) -> Result<PostOutcome, AttemptError> {
+    let mut request = agent.post(url);
+    if let Some(key) = bearer_key {
+        request = request.header("Authorization", format!("Bearer {key}"));
+    }
+    let response = request
+        .send_json(body)
+        .map_err(|e| transport_error(e, url, bearer_key, kind))?;
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
+    let mut response_body = response.into_body();
+    if !(200..300).contains(&status) {
+        let mut raw = Vec::new();
+        // A partial error body still yields a useful message.
+        let _ = response_body
+            .as_reader()
+            .take(MAX_ERROR_BODY_BYTES)
+            .read_to_end(&mut raw);
+        return Ok(PostOutcome::Error {
+            status,
+            retry_after,
+            message: error_body_message(&raw, bearer_key),
+        });
+    }
+    let body = response_body
+        .with_config()
+        .limit(MAX_SUCCESS_BODY_BYTES)
+        .read_to_vec()
+        .map_err(|e| transport_error(e, url, bearer_key, kind))?;
+    Ok(PostOutcome::Success { body })
+}
+
+/// Classifies a non-2xx response: 429 and 5xx are transient, the rest fatal.
+pub(crate) fn classify_http(
+    status: u16,
+    error: anyhow::Error,
+    retry_after: Option<Duration>,
+) -> AttemptError {
+    if status == 429 || (500..600).contains(&status) {
+        AttemptError::Transient {
+            error,
+            kind: format!("HTTP {status}"),
+            retry_after,
+        }
+    } else {
+        AttemptError::Fatal(error)
+    }
+}
+
+/// Parses a success body, reporting the backend kind on invalid JSON.
+pub(crate) fn parse_body<T: serde::de::DeserializeOwned>(
+    raw: &[u8],
+    kind: &str,
+) -> Result<T, AttemptError> {
+    serde_json::from_slice(raw).map_err(|e| {
+        AttemptError::Fatal(anyhow!(
+            "{kind} server returned an invalid response body: {e}"
+        ))
+    })
+}
+
+/// Retries transient attempts with capped exponential backoff, up to
+/// `max_retries` after the first attempt.
+pub(crate) fn retry_transient<T>(
+    url: &str,
+    kind: &str,
+    max_retries: u32,
+    backoff_base: Duration,
+    mut attempt: impl FnMut() -> Result<T, AttemptError>,
+) -> Result<T> {
+    let attempts = max_retries.saturating_add(1);
+    let mut attempt_no: u32 = 0;
+    loop {
+        attempt_no = attempt_no.saturating_add(1);
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(AttemptError::Fatal(error)) => return Err(error),
+            Err(AttemptError::Transient {
+                error,
+                kind: label,
+                retry_after,
+            }) => {
+                if attempt_no >= attempts {
+                    return Err(error.context(format!(
+                        "{kind} request to {url} failed after {attempt_no} attempt(s)"
+                    )));
+                }
+                let delay = retry_after
+                    .map(|hint| hint.min(MAX_BACKOFF))
+                    .unwrap_or_else(|| backoff_delay(backoff_base, attempt_no));
+                eprintln!(
+                    "warning: {kind} request attempt {attempt_no}/{attempts} failed ({label}), retrying in {}ms",
+                    delay.as_millis()
+                );
+                thread::sleep(delay);
+            }
+        }
+    }
+}
+
+fn transport_error(
+    error: ureq::Error,
+    url: &str,
+    bearer_key: Option<&str>,
+    kind: &str,
+) -> AttemptError {
+    let label = match &error {
+        ureq::Error::Timeout(_) => Some("timeout"),
+        ureq::Error::Io(_) => Some("I/O error"),
+        ureq::Error::ConnectionFailed => Some("connection failed"),
+        ureq::Error::HostNotFound => Some("host not found"),
+        _ => None,
+    };
+    let error = match error {
+        ureq::Error::BodyExceedsLimit(_) => {
+            anyhow!("{kind} response exceeds the {MAX_SUCCESS_BODY_MIB} MiB limit")
+        }
+        ureq::Error::Http(_) => {
+            anyhow!(
+                "{kind} request could not be built; check that the API key is a valid header value"
+            )
+        }
+        other => anyhow!(
+            "{kind} request to {url} failed: {}",
+            sanitize(&other.to_string(), bearer_key)
+        ),
+    };
+    match label {
+        Some(label) => AttemptError::Transient {
+            error,
+            kind: label.to_owned(),
+            retry_after: None,
+        },
+        None => AttemptError::Fatal(error),
+    }
+}
+
+/// Extracts the API error message from `raw`, falling back to the raw text,
+/// sanitized by [`sanitize`] and truncated.
+fn error_body_message(raw: &[u8], bearer_key: Option<&str>) -> String {
+    let message = match serde_json::from_slice::<ErrorEnvelope>(raw) {
+        Ok(ErrorEnvelope {
+            error: ErrorDetail::Object { message } | ErrorDetail::Text(message),
+        }) => message,
+        Err(_) => String::from_utf8_lossy(raw).into_owned(),
+    };
+    let message = sanitize(&message, bearer_key);
+    let message = truncate_on_char_boundary(message.trim(), MAX_ERROR_MESSAGE_BYTES);
+    if message.is_empty() {
+        "<empty response body>".to_owned()
+    } else {
+        message.to_owned()
+    }
+}
+
+/// Removes control characters, then replaces the API key and its
+/// URL-encoded and base64 forms with `<redacted>`.
+///
+/// Control characters go first so that ones inserted inside an echoed key
+/// cannot split it past the redaction.
+fn sanitize(text: &str, bearer_key: Option<&str>) -> String {
+    let mut clean: String = text.chars().filter(|c| !c.is_control()).collect();
+    let Some(key) = bearer_key else {
+        return clean;
+    };
+    let url_encoded: String = url::form_urlencoded::byte_serialize(key.as_bytes()).collect();
+    let mut forms = [
+        key.to_owned(),
+        url_encoded,
+        STANDARD.encode(key),
+        STANDARD_NO_PAD.encode(key),
+        URL_SAFE.encode(key),
+        URL_SAFE_NO_PAD.encode(key),
+    ];
+    // Longest first, so a padded form is replaced before its unpadded prefix.
+    forms.sort_by_key(|form| std::cmp::Reverse(form.len()));
+    for form in forms.iter().filter(|form| !form.is_empty()) {
+        clean = clean.replace(form.as_str(), "<redacted>");
+    }
+    clean
 }
 
 impl RemoteEmbedder {
@@ -208,17 +441,7 @@ impl RemoteEmbedder {
         }
         endpoint.max_retries = endpoint.max_retries.min(MAX_RETRIES);
         endpoint.timeout = endpoint.timeout.min(MAX_TIMEOUT);
-        let tls = TlsConfig::builder()
-            .provider(TlsProvider::NativeTls)
-            .root_certs(RootCerts::PlatformVerifier)
-            .build();
-        let agent: Agent = Agent::config_builder()
-            .tls_config(tls)
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .timeout_global(Some(endpoint.timeout))
-            .build()
-            .into();
+        let agent = build_agent(endpoint.timeout);
         Ok(Self {
             url: endpoint.embeddings_url(),
             endpoint,
@@ -302,35 +525,13 @@ impl RemoteEmbedder {
             encoding_format: "float",
             dimensions: self.dimensions,
         };
-        let attempts = self.endpoint.max_retries.saturating_add(1);
-        let mut attempt: u32 = 0;
-        loop {
-            attempt = attempt.saturating_add(1);
-            match self.attempt(&body, inputs.len()) {
-                Ok(vectors) => return Ok(vectors),
-                Err(AttemptError::Fatal(error)) => return Err(error),
-                Err(AttemptError::Transient {
-                    error,
-                    kind,
-                    retry_after,
-                }) => {
-                    if attempt >= attempts {
-                        return Err(error.context(format!(
-                            "embedding request to {} failed after {attempt} attempt(s)",
-                            self.url
-                        )));
-                    }
-                    let delay = retry_after
-                        .map(|hint| hint.min(MAX_BACKOFF))
-                        .unwrap_or_else(|| backoff_delay(self.backoff_base, attempt));
-                    eprintln!(
-                        "warning: embedding request attempt {attempt}/{attempts} failed ({kind}), retrying in {}ms",
-                        delay.as_millis()
-                    );
-                    thread::sleep(delay);
-                }
-            }
-        }
+        retry_transient(
+            &self.url,
+            "embedding",
+            self.endpoint.max_retries,
+            self.backoff_base,
+            || self.attempt(&body, inputs.len()),
+        )
     }
 
     fn attempt(
@@ -338,137 +539,32 @@ impl RemoteEmbedder {
         body: &EmbeddingRequest<'_>,
         expected: usize,
     ) -> Result<Vec<Vec<f32>>, AttemptError> {
-        let mut request = self.agent.post(&self.url);
-        if let Some(key) = self.endpoint.bearer_key() {
-            request = request.header("Authorization", format!("Bearer {key}"));
-        }
-        let response = request
-            .send_json(body)
-            .map_err(|e| self.transport_error(e))?;
-        let status = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .map(Duration::from_secs);
-        let mut response_body = response.into_body();
-
-        if !(200..300).contains(&status) {
-            let mut raw = Vec::new();
-            // A partial error body still yields a useful message.
-            let _ = response_body
-                .as_reader()
-                .take(MAX_ERROR_BODY_BYTES)
-                .read_to_end(&mut raw);
-            let message = self.error_message(&raw);
-            let error = match (status, self.dimensions) {
-                (400 | 422, Some(dims)) => anyhow!(
-                    "embedding_dimensions={dims} rejected by {}: {message} (HTTP {status})",
-                    self.model
-                ),
-                _ => anyhow!("embedding server returned HTTP {status}: {message}"),
-            };
-            return Err(if status == 429 || (500..600).contains(&status) {
-                AttemptError::Transient {
-                    error,
-                    kind: format!("HTTP {status}"),
-                    retry_after,
-                }
-            } else {
-                AttemptError::Fatal(error)
-            });
-        }
-
-        let raw = response_body
-            .with_config()
-            .limit(MAX_SUCCESS_BODY_BYTES)
-            .read_to_vec()
-            .map_err(|e| self.transport_error(e))?;
-        let parsed: EmbeddingResponse = serde_json::from_slice(&raw).map_err(|e| {
-            AttemptError::Fatal(anyhow!(
-                "embedding server returned an invalid response body: {e}"
-            ))
-        })?;
-        validate_response(parsed, expected).map_err(AttemptError::Fatal)
-    }
-
-    fn transport_error(&self, error: ureq::Error) -> AttemptError {
-        let kind = match &error {
-            ureq::Error::Timeout(_) => Some("timeout"),
-            ureq::Error::Io(_) => Some("I/O error"),
-            ureq::Error::ConnectionFailed => Some("connection failed"),
-            ureq::Error::HostNotFound => Some("host not found"),
-            _ => None,
-        };
-        let error = match error {
-            ureq::Error::BodyExceedsLimit(_) => {
-                anyhow!("embedding response exceeds the {MAX_SUCCESS_BODY_MIB} MiB limit")
+        match post_json(
+            &self.agent,
+            &self.url,
+            self.endpoint.bearer_key(),
+            "embedding",
+            body,
+        )? {
+            PostOutcome::Success { body: raw } => {
+                let parsed: EmbeddingResponse = parse_body(&raw, "embedding")?;
+                validate_response(parsed, expected).map_err(AttemptError::Fatal)
             }
-            ureq::Error::Http(_) => {
-                anyhow!(
-                    "embedding request could not be built; check that the API key is a valid header value"
-                )
+            PostOutcome::Error {
+                status,
+                retry_after,
+                message,
+            } => {
+                let error = match (status, self.dimensions) {
+                    (400 | 422, Some(dims)) => anyhow!(
+                        "embedding_dimensions={dims} rejected by {}: {message} (HTTP {status})",
+                        self.model
+                    ),
+                    _ => anyhow!("embedding server returned HTTP {status}: {message}"),
+                };
+                Err(classify_http(status, error, retry_after))
             }
-            other => anyhow!(
-                "embedding request to {} failed: {}",
-                self.url,
-                self.sanitize(&other.to_string())
-            ),
-        };
-        match kind {
-            Some(kind) => AttemptError::Transient {
-                error,
-                kind: kind.to_owned(),
-                retry_after: None,
-            },
-            None => AttemptError::Fatal(error),
         }
-    }
-
-    /// Extracts the API error message from `raw`, falling back to the raw text,
-    /// sanitized by [`Self::sanitize`] and truncated.
-    fn error_message(&self, raw: &[u8]) -> String {
-        let message = match serde_json::from_slice::<ErrorEnvelope>(raw) {
-            Ok(ErrorEnvelope {
-                error: ErrorDetail::Object { message } | ErrorDetail::Text(message),
-            }) => message,
-            Err(_) => String::from_utf8_lossy(raw).into_owned(),
-        };
-        let message = self.sanitize(&message);
-        let message = truncate_on_char_boundary(message.trim(), MAX_ERROR_MESSAGE_BYTES);
-        if message.is_empty() {
-            "<empty response body>".to_owned()
-        } else {
-            message.to_owned()
-        }
-    }
-
-    /// Removes control characters, then replaces the API key and its
-    /// URL-encoded and base64 forms with `<redacted>`.
-    ///
-    /// Control characters go first so that ones inserted inside an echoed key
-    /// cannot split it past the redaction.
-    fn sanitize(&self, text: &str) -> String {
-        let mut clean: String = text.chars().filter(|c| !c.is_control()).collect();
-        let Some(key) = self.endpoint.bearer_key() else {
-            return clean;
-        };
-        let url_encoded: String = url::form_urlencoded::byte_serialize(key.as_bytes()).collect();
-        let mut forms = [
-            key.to_owned(),
-            url_encoded,
-            STANDARD.encode(key),
-            STANDARD_NO_PAD.encode(key),
-            URL_SAFE.encode(key),
-            URL_SAFE_NO_PAD.encode(key),
-        ];
-        // Longest first, so a padded form is replaced before its unpadded prefix.
-        forms.sort_by_key(|form| std::cmp::Reverse(form.len()));
-        for form in forms.iter().filter(|form| !form.is_empty()) {
-            clean = clean.replace(form.as_str(), "<redacted>");
-        }
-        clean
     }
 }
 

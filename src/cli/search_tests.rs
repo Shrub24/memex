@@ -30,6 +30,7 @@ fn request(
         fields: search_fields(None, false).unwrap(),
         sort: SortBy::Score,
         verbose: false,
+        rerank: None,
         format: SearchFormat::Json,
         root: Some(paths.root.clone()),
         machines: vec!["local".into()],

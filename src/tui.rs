@@ -5880,7 +5880,10 @@ fn run_search_request(
                 text_limit: Some(crate::machine::SEARCH_TEXT_BUDGET),
             },
             &crate::search::Selection::conversations(RESULT_LIMIT, request.kind),
-            false,
+            crate::search::CollectMode {
+                auto_index_local: false,
+                rerank: None,
+            },
         )?;
         let matchers = crate::cli::build_matchers(&request.query)?;
         let sessions = result

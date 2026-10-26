@@ -90,6 +90,34 @@ memex sends transcript text (user and assistant messages, each truncated to 8192
 memory documents to the endpoint. Plain `http://` to a non-loopback host is rejected when a
 key is set and warned about otherwise; `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` are
 honored.
+
+## Remote reranking
+
+With `--rerank --rerank-remote`, conversation search results are rescored through a
+Cohere/Voyage/Jina-style rerank API (`POST {base_url}/rerank`) instead of the local
+cross-encoder. The remote endpoint is independent of the embedding one: separate URL,
+key, timeout, and retries.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `rerank_base_url` | none | `http` or `https` base URL; required; requests go to `{base_url}/rerank` |
+| `rerank_model` | none | Provider model name, passed verbatim; required unless `--rerank-model` |
+| `rerank_api_key` | none | Literal API key |
+| `rerank_api_key_env` | none | Variable holding the API key |
+| `rerank_timeout_secs` | 10 | Per-attempt timeout in seconds (1 to 600) |
+| `rerank_max_retries` | 0 | Retries on 429, 5xx, timeouts, and connection errors (0 to 10) |
+
+The remote model is `--rerank-model`, else `rerank_model`; the embedding `model` is never
+reused. The key is `rerank_api_key`, else only the variable named by `rerank_api_key_env`,
+else `MEMEX_RERANK_API_KEY`; embedding key variables are never consulted, so no key is
+sent to another provider. No key is required for loopback servers. Defaults fail fast: a
+10-second timeout and a single attempt.
+
+```toml
+rerank_base_url = "https://api.cohere.com/v2"
+rerank_model = "rerank-v3.5"
+```
+
 ## Execution provider
 
 Select via `execution_provider` in config or `MEMEX_EXECUTION_PROVIDER`:
@@ -127,6 +155,11 @@ embedding_batch_size = 64  # local and remote
 # embedding_api_key = "sk-..."  # remote only; takes precedence over embedding_api_key_env
 embedding_timeout_secs = 60  # remote only; 1 to 600
 embedding_max_retries = 3  # remote only; 0 to 10
+# rerank_base_url = "https://api.cohere.com/v2"  # for --rerank-remote
+# rerank_model = "rerank-v3.5"  # --rerank-model takes precedence
+# rerank_api_key_env = "MEMEX_RERANK_API_KEY"  # or rerank_api_key literal
+# rerank_timeout_secs = 10  # rerank only; 1 to 600
+# rerank_max_retries = 0  # rerank only; 0 to 10
 execution_provider = "auto"  # auto, cpu, coreml, cuda
 cuda_device_id = 0  # optional, when execution_provider = "cuda"
 cuda_library_paths = ["/usr/local/cuda/lib64"]  # optional list of CUDA library dirs

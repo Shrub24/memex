@@ -1550,7 +1550,10 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                 text_limit: Some(crate::machine::SEARCH_TEXT_BUDGET),
             },
             &crate::search::Selection::conversations(target, params.origin),
-            false,
+            crate::search::CollectMode {
+                auto_index_local: false,
+                rerank: None,
+            },
         )?;
         let has_more = found.items.len() > params.offset.saturating_add(params.limit);
         let matchers = crate::cli::build_matchers(&params.query)?;
